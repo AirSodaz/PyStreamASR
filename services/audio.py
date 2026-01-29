@@ -10,18 +10,23 @@ class AudioProcessor:
         self.resampler = torchaudio.transforms.Resample(orig_freq=8000, new_freq=16000)
 
     def decode_g711(self, data: bytes) -> np.ndarray:
-        """Decodes G.711 A-law bytes to PCM 16-bit integers.
+        """Decodes G.711 A-law bytes to PCM (int16 or float32).
 
         Args:
             data (bytes): The input G.711 A-law encoded audio bytes.
 
         Returns:
-            np.ndarray: A numpy array of int16 PCM data.
+            np.ndarray: A numpy array of int16 PCM data or float32 data.
         """
-        # g711.decode_alaw returns bytes representing int16 PCM
-        pcm_bytes = g711.decode_alaw(data)
+        # g711.decode_alaw returns bytes representing int16 PCM (in older versions)
+        # or a numpy array of float32 (in newer versions like 1.6.5)
+        decoded = g711.decode_alaw(data)
+
+        if isinstance(decoded, np.ndarray):
+            return decoded
+
         # Convert bytes to numpy array of int16
-        return np.frombuffer(pcm_bytes, dtype=np.int16)
+        return np.frombuffer(decoded, dtype=np.int16)
 
     def resample(self, pcm_data: np.ndarray) -> torch.Tensor:
         """Resamples 8000Hz PCM data to 16000Hz.
@@ -49,11 +54,16 @@ class AudioProcessor:
             torch.Tensor: A Float32 Tensor normalized to the [-1, 1] range.
         """
         # 1. Decode
-        pcm_int16 = self.decode_g711(chunk)
+        pcm_data = self.decode_g711(chunk)
 
         # 2. Resample
-        # Convert to float and normalize to [-1, 1] by dividing by 32768.0
-        waveform = torch.from_numpy(pcm_int16).float() / 32768.0
+        # Convert to float
+        waveform = torch.from_numpy(pcm_data).float()
+
+        # Normalize to [-1, 1] only if it was integer data
+        # If g711 returned float array, it is already normalized [-1, 1]
+        if pcm_data.dtype == np.int16:
+            waveform = waveform / 32768.0
 
         resampled = self.resampler(waveform)
 
