@@ -6,12 +6,14 @@ from typing import Dict, Any, Tuple
 def load_model() -> AutoModel:
     """Loads the FunASR model with VAD and Punctuation support.
 
-    Uses CUDA if available, otherwise falls back to CPU.
+    Uses CUDA or MPS if available, otherwise falls back to CPU.
 
     Returns:
         AutoModel: The loaded FunASR model instance.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else \
+             "mps" if torch.backends.mps.is_available() else \
+             "cpu"
     print(f"[Inference] Loading FunASR AutoModel on {device}...")
     
     # Load paraformer-zh-streaming with fsmn-vad and ct-punc

@@ -52,13 +52,14 @@ PyStreamASR/
 
 ## 4. Common Operational Commands
 * **Run Server (Dev Mode):**
-    
+  
     ```bash
     uvicorn main:app --reload
     ```
 
 ## 5. Coding Standards
 * **Type Hinting:** Use strict Python type hints (`def func(a: int) -> str:`).
+* **Docstring Style:** Use **Google Style**.
 * **Error Handling:**
     * Wrap WebSocket logic in `try/except WebSocketDisconnect`.
     * Ensure DB sessions are closed in `finally` blocks.
