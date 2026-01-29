@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+websockets
+funasr
+modelscope
+torch
+torchaudio
+numpy
+g711
+redis
+sqlalchemy
+aiomysql
+asyncmy
+pydantic-settings
+python-dotenv
+soundfile
+librosa
