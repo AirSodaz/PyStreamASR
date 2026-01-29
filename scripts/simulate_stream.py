@@ -13,6 +13,11 @@ import numpy as np
 import websockets
 import json
 import time
+import os
+import redis.asyncio as redis
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     import soundfile as sf
@@ -132,11 +137,43 @@ async def receive_results(websocket):
     except Exception as e:
         print(f"Receive error: {e}")
 
+async def monitor_redis(session_id: str, redis_url: str):
+    """
+    Polls Redis for real-time partial transcription updates.
+    """
+    print(f"Connecting to Redis at {redis_url} for session {session_id}...")
+    try:
+        client = redis.from_url(redis_url, decode_responses=True)
+        key = f"asr:sess:{session_id}:current"
+        
+        last_seq = -1
+        
+        while True:
+            # Poll every 0.1s
+            data = await client.hgetall(key)
+            if data:
+                seq = int(data.get("seq", -1))
+                content = data.get("content", "")
+                
+                if seq > last_seq:
+                    print(f"[Redis] Partial (Seq: {seq}): {content}")
+                    last_seq = seq
+            
+            await asyncio.sleep(0.1)
+            
+    except asyncio.CancelledError:
+        print("Redis monitoring stopped.")
+        await client.aclose()
+    except Exception as e:
+        print(f"Redis monitor error: {e}")
+
 async def main():
     parser = argparse.ArgumentParser(description="Simulate WebSocket Audio Stream")
     parser.add_argument("--file", default="test_audio.wav", help="Path to input audio file")
     parser.add_argument("--host", default="ws://localhost:8000/ws/transcribe/test-session-1", help="WebSocket URL")
-    parser.add_argument("--chunk_duration", type=float, default=0.1, help="Chunk duration in seconds")
+    parser.add_argument("--chunk_duration", type=float, default=1, help="Chunk duration in seconds")
+    parser.add_argument("--redis", action="store_true", help="Enable Redis monitoring")
+    parser.add_argument("--redis_url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"), help="Redis URL")
     
     args = parser.parse_args()
     
@@ -146,19 +183,30 @@ async def main():
         async with websockets.connect(args.host) as websocket:
             print("Connected.")
             
+            # Extract session_id from URL for Redis monitoring
+            # URL format: .../ws/transcribe/{session_id}
+            session_id = args.host.split("/")[-1]
+
             # Run send and receive in parallel
-            send_task = asyncio.create_task(send_audio(websocket, args.file, args.chunk_duration))
-            recv_task = asyncio.create_task(receive_results(websocket))
+            tasks = [
+                asyncio.create_task(send_audio(websocket, args.file, args.chunk_duration)),
+                asyncio.create_task(receive_results(websocket))
+            ]
+
+            if args.redis:
+                redis_task = asyncio.create_task(monitor_redis(session_id, args.redis_url))
+                tasks.append(redis_task)
             
-            # Wait for sender to finish
-            await send_task
+            # Wait for sender to finish (first task)
+            await tasks[0]
             
             # Allow some time for final results to return
             print("Waiting for final results...")
             await asyncio.sleep(2.0)
             
-            # Cancel receiver
-            recv_task.cancel()
+            # Cancel utility tasks
+            for task in tasks[1:]:
+                task.cancel()
             
     except Exception as e:
         print(f"Connection failed: {e}")
