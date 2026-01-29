@@ -1,4 +1,5 @@
 import json
+import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from services.audio import AudioProcessor
 from services.storage import StorageManager
@@ -46,7 +47,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             # 2. Process Audio (G.711 -> PCM -> Tensor)
             try:
-                tensor = processor.process(data)
+                loop = asyncio.get_running_loop()
+                tensor = await loop.run_in_executor(None, processor.process, data)
             except Exception as e:
                 print(f"[WebSocket] Audio processing error: {e}")
                 continue
