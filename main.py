@@ -6,6 +6,7 @@ import logging
 setup_logging(settings)
 
 from services.inference import load_model
+from services.storage import check_database_connections
 from api.endpoints import router as api_router
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -15,6 +16,10 @@ async def lifespan(app: FastAPI):
     # Load the model on startup
     logging.info("Loading AI Model...")
     app.state.model = load_model()
+    
+    # Check Database Connections
+    await check_database_connections()
+
     yield
     # Cleanup on shutdown if needed
     logging.info("Shutting down...")

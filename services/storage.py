@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 import uuid
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import select
+import logging
+from sqlalchemy import select, text
 from core.config import settings
 from models.schemas import Segment
 
@@ -12,6 +13,24 @@ AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_co
 
 # Redis Setup
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+
+async def check_database_connections():
+    """Checks connections to MySQL and Redis."""
+    try:
+        logging.info("Checking database connections...")
+        # Check MySQL
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+        logging.info("MySQL connection successful.")
+
+        # Check Redis
+        await redis_client.ping()
+        logging.info("Redis connection successful.")
+
+    except Exception as e:
+        logging.error(f"Database connection failed: {e}")
+        raise e
 
 
 class StorageManager:
