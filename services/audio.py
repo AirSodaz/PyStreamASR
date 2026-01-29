@@ -32,20 +32,20 @@ class AudioProcessor:
         """Resamples 8000Hz PCM data to 16000Hz.
 
         Args:
-            pcm_data (np.ndarray): The input PCM data as a numpy array of int16.
+            pcm_data (np.ndarray): The input PCM data as a numpy array of float32.
 
         Returns:
             torch.Tensor: The resampled waveform as a float32 tensor.
         """
-        # Convert numpy array to torch tensor and normalize to float32
-        waveform = torch.from_numpy(pcm_data).float()
+        # Convert numpy array to torch tensor
+        waveform = torch.from_numpy(pcm_data)
 
         # Resampler expects (channel, time) or (time)
         resampled_waveform = self.resampler(waveform)
         return resampled_waveform
 
     def process(self, chunk: bytes) -> torch.Tensor:
-        """Full pipeline: Decode G.711 -> Resample -> Normalize.
+        """Full pipeline: Decode G.711 -> Normalize -> Resample.
 
         Args:
             chunk (bytes): The input audio chunk in G.711 A-law format.
@@ -56,15 +56,10 @@ class AudioProcessor:
         # 1. Decode
         pcm_data = self.decode_g711(chunk)
 
-        # 2. Resample
-        # Convert to float
-        waveform = torch.from_numpy(pcm_data).float()
-
-        # Normalize to [-1, 1] only if it was integer data
+        # 2. Normalize to [-1, 1] only if it was integer data
         # If g711 returned float array, it is already normalized [-1, 1]
         if pcm_data.dtype == np.int16:
-            waveform = waveform / 32768.0
+            pcm_data = pcm_data.astype(np.float32) / 32768.0
 
-        resampled = self.resampler(waveform)
-
-        return resampled
+        # 3. Resample using the class method
+        return self.resample(pcm_data)
