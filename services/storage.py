@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 import logging
 from sqlalchemy import select, text
 from core.config import settings
-from models.schemas import Segment
+from services.schemas import Segment
 
 # Database Setup
 engine = create_async_engine(settings.MYSQL_DATABASE_URL, echo=False)

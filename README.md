@@ -75,8 +75,8 @@ python scripts/simulate_stream.py --file path/to/audio.wav --host ws://127.0.0.1
 PyStreamASR/
 ├── api/             # API endpoints and routers
 ├── core/            # Configuration and global settings
-├── models/          # Database schemas (SQLAlchemy)
-├── services/        # Business logic (Audio, Inference, Storage)
+├── models/          # (Deprecated)
+├── services/        # Business logic (Audio, Inference, Storage, Schemas)
 ├── scripts/         # Utility and test scripts
 ├── main.py          # Application entry point
 └── requirements.txt # Project dependencies

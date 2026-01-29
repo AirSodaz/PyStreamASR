@@ -34,12 +34,12 @@ PyStreamASR/
 │   ├── __init__.py
 │   └── config.py             # Pydantic Settings, Env loading, & Constants.
 ├── models/
-│   ├── __init__.py
-│   └── schemas.py            # SQLAlchemy Async Models (Tables: 'sessions', 'segments').
+│   └── __init__.py
 ├── services/
 │   ├── __init__.py
 │   ├── audio.py              # AudioProcessor class (G.711 decoding, Resampling).
 │   ├── inference.py          # ASRInferenceService class (Model loading, ThreadPool execution).
+│   ├── schemas.py            # SQLAlchemy Async Models (Tables: 'sessions', 'segments').
 │   └── storage.py            # StorageManager class (Redis buffering, MySQL persistence).
 ├── scripts/
 │   ├── tests/                # (Placeholder for pytest)
