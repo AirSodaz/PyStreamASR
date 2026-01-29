@@ -13,23 +13,29 @@ AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_co
 # Redis Setup
 redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
+
 class StorageManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
 
     async def get_next_sequence(self) -> int:
-        """
-        Atomically increments the sequence counter for this session in Redis.
-        Returns the new sequence number.
+        """Atomically increments the sequence counter for this session in Redis.
+
+        Returns:
+            int: The new sequence number.
         """
         key = f"asr:sess:{self.session_id}:seq"
         return await redis_client.incr(key)
 
     async def save_partial(self, text: str, seq: int):
-        """
-        Saves the partial draft to Redis.
+        """Saves the partial draft to Redis.
+
         Key: asr:sess:{id}:current
         TTL: 300 seconds
+
+        Args:
+            text (str): The partial transcription text.
+            seq (int): The current sequence number.
         """
         key = f"asr:sess:{self.session_id}:current"
         mapping = {
@@ -43,11 +49,18 @@ class StorageManager:
             await pipe.execute()
 
     async def save_final(self, text: str):
-        """
+        """Persists the final segment to MySQL and clears the Redis draft.
+
         1. Generates UUID.
         2. Gets next sequence number.
         3. Persists to MySQL `Segment` table.
         4. Deletes the 'current' draft from Redis.
+
+        Args:
+            text (str): The final transcription text.
+
+        Returns:
+            Segment: The saved segment object.
         """
         # 1. Get Sequence
         seq = await self.get_next_sequence()
@@ -70,5 +83,5 @@ class StorageManager:
         # 4. Delete Draft from Redis
         key = f"asr:sess:{self.session_id}:current"
         await redis_client.delete(key)
-        
+
         return new_segment

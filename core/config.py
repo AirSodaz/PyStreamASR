@@ -1,6 +1,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
+    """Application settings using Pydantic BaseSettings.
+
+    Loads configuration from environment variables or .env file.
+    """
     PROJECT_NAME: str = "PyStreamASR"
     MYSQL_DATABASE_URL: str
     REDIS_URL: str
@@ -14,5 +19,6 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="ignore"
     )
+
 
 settings = Settings()

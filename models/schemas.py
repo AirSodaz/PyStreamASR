@@ -4,17 +4,37 @@ from sqlalchemy import String, Integer, Text, DateTime, Index, ForeignKey
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import AsyncAttrs
 
+
 class Base(AsyncAttrs, DeclarativeBase):
+    """Base class for SQLAlchemy models using AsyncAttrs."""
     pass
 
+
 class Session(Base):
+    """SQLAlchemy model representing a transcription session.
+
+    Attributes:
+        id (str): Unique session identifier.
+        user_id (str): ID of the user owning the session.
+        created_at (datetime): Timestamp when the session was created.
+    """
     __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+
 class Segment(Base):
+    """SQLAlchemy model representing a transcribed text segment.
+
+    Attributes:
+        id (str): Unique segment identifier (UUID).
+        session_id (str): Foreign key to the session.
+        segment_seq (int): Sequence number of the segment within the session.
+        content (str): The transcribed text content.
+        created_at (datetime): Timestamp when the segment was created.
+    """
     __tablename__ = "segments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
