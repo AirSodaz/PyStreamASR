@@ -14,6 +14,7 @@ import websockets
 import json
 import time
 import os
+import struct
 import redis.asyncio as redis
 from dotenv import load_dotenv
 
@@ -56,63 +57,141 @@ def convert_to_alaw(pcm_data_int16):
     # audioop.lin2alaw takes bytes, width (2 for 16-bit)
     return audioop.lin2alaw(pcm_data_int16.tobytes(), 2)
 
-async def send_audio(websocket, audio_file, chunk_duration):
+def parse_wav_header(file_path):
     """
-    Reads audio, resamples to 8000Hz, encodes to G.711 A-law, and streams chunks.
+    Parses WAV header to determine if it's G.711 A-law (Format=6) or PCM (Format=1).
+    Returns (is_alaw, data_start_offset, data_length)
+    is_alaw is True if Format=6 (A-law), Channels=1, SampleRate=8000, Bits=8.
     """
-    print(f"Loading and processing {audio_file}...")
-    
-    # 1. Load and Resample to 8000 Hz
-    # librosa.load can resample on the fly
     try:
+        with open(file_path, 'rb') as f:
+            # RIFF header
+            chunk_id, size, format_tag = struct.unpack('<4sI4s', f.read(12))
+            if chunk_id != b'RIFF' or format_tag != b'WAVE':
+                return False, 0, 0
+            
+            # Find chunks
+            while True:
+                chunk_header = f.read(8)
+                if len(chunk_header) < 8:
+                    break
+                subchunk_id, subchunk_size = struct.unpack('<4sI', chunk_header)
+                
+                if subchunk_id == b'fmt ':
+                    # Parse fmt chunk
+                    fmt_data = f.read(subchunk_size)
+                    audio_format, num_channels, sample_rate, byte_rate, block_align, bits_per_sample = struct.unpack('<HHIIHH', fmt_data[:16])
+                    
+                    # Check for G.711 A-law: Format 6, 1 channel, 8000Hz, 8 bits
+                    if audio_format == 6 and num_channels == 1 and sample_rate == 8000 and bits_per_sample == 8:
+                        # Found A-law, but need to find data chunk next
+                        pass
+                    elif audio_format == 7: # Mu-law
+                         pass
+                    elif audio_format == 1: # PCM
+                         pass
+                    
+                    # Store params for return if needed, but we just want boolean "is_alaw_ready"
+                    is_alaw_ready = (audio_format == 6 and num_channels == 1 and sample_rate == 8000 and bits_per_sample == 8)
+                    
+                    if subchunk_size > 16:
+                        # Skip extra bytes if any (though we read subchunk_size above? No we read subchunk_size bytes? 
+                        # Wait, f.read(subchunk_size) reads ALL content. correct.)
+                        pass
+
+                elif subchunk_id == b'data':
+                    # Found data
+                    data_start = f.tell()
+                    return (locals().get('is_alaw_ready', False), data_start, subchunk_size)
+                else:
+                    # Skip other chunks
+                    f.seek(subchunk_size, 1)
+                    
+    except Exception as e:
+        print(f"Header parse error: {e}")
+    
+    return False, 0, 0
+
+async def get_audio_generator(audio_file, chunk_duration):
+    """
+    Yields chunks of G.711 A-law bytes.
+    Handles raw files, G.711 WAVs, and standard PCM WAVs (via conversion).
+    """
+    chunk_size = int(8000 * chunk_duration)
+    
+    # 1. Check extension for raw
+    ext = os.path.splitext(audio_file)[1].lower()
+    if ext in ['.alaw', '.pcma', '.g711']:
+        print(f"Detected raw G.711 file: {audio_file}")
+        with open(audio_file, 'rb') as f:
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                yield data
+        return
+
+    # 2. Check WAV header
+    is_alaw, data_offset, data_len = parse_wav_header(audio_file)
+    if is_alaw:
+        print(f"Detected G.711 A-law WAV: {audio_file} (passing through)")
+        with open(audio_file, 'rb') as f:
+            f.seek(data_offset)
+            read_bytes = 0
+            while read_bytes < data_len:
+                # Determine read size
+                bytes_to_read = min(chunk_size, data_len - read_bytes)
+                if bytes_to_read == 0:
+                    break
+                data = f.read(bytes_to_read)
+                if not data:
+                    break
+                yield data
+                read_bytes += len(data)
+        return
+
+    # 3. Fallback to Librosa/Conversion (Standard PCM)
+    print(f"Processing as PCM WAV/Audio: {audio_file}...")
+    try:
+        # Load and Resample
         y, sr = librosa.load(audio_file, sr=8000)
     except Exception as e:
         print(f"Failed to load audio: {e}")
         return
 
-    # 2. Convert Float32 to Int16 PCM
-    # librosa output is -1 to 1 float
+    # Convert to Int16
     pcm_data = (y * 32767).astype(np.int16)
     
-    # 3. Encode to G.711 A-law
-    # Total bytes expected
+    # Encode
     raw_bytes = convert_to_alaw(pcm_data)
     
-    # 4. Calculate Chunk Size
-    # G.711 is 1 byte per sample. 8000 samples/sec.
-    # Chunk size = 8000 * chunk_duration
-    chunk_size = int(8000 * chunk_duration)
-    
     total_len = len(raw_bytes)
-    print(f"Audio ready. Duration: {len(y)/8000:.2f}s. Total Bytes: {total_len}. Chunk Size: {chunk_size}")
-    
-    # 5. Stream
     offset = 0
+    while offset < total_len:
+        end = min(offset + chunk_size, total_len)
+        yield raw_bytes[offset:end]
+        offset = end
+
+async def send_audio(websocket, audio_file, chunk_duration):
+    """
+    Streams audio chunks to WebSocket.
+    """
+    print(f"Preparing stream for {audio_file}...")
+    
+    chunk_generator = get_audio_generator(audio_file, chunk_duration)
+    
     start_time = time.time()
+    chunk_count = 0
     
     try:
-        while offset < total_len:
-            end = min(offset + chunk_size, total_len)
-            chunk = raw_bytes[offset:end]
-            
-            # Send binary frame
+        async for chunk in chunk_generator:
             await websocket.send(chunk)
-            
-            offset = end
+            chunk_count += 1
             
             # Real-time simulation sleep
-            # Adjust sleep to match real-time (rudimentary)
             await asyncio.sleep(chunk_duration)
             
-            # Optional: print progress?
-            # sys.stdout.write(f"\rSent {offset}/{total_len} bytes")
-            # sys.stdout.flush()
-            
-        print("\nFinished sending audio.")
-        # Send a special message or just ensure we keep listening for final results?
-        # Usually client might send an EOF or just close, or wait for final silence?
-        # For this test, we just wait a bit then close? 
-        # But `receive_results` loop is running.
+        print(f"\nFinished sending audio. Chunks sent: {chunk_count}")
         
     except Exception as e:
         print(f"\nSend error: {e}")
@@ -171,7 +250,7 @@ async def main():
     parser = argparse.ArgumentParser(description="Simulate WebSocket Audio Stream")
     parser.add_argument("--file", default="test_audio.wav", help="Path to input audio file")
     parser.add_argument("--host", default="ws://localhost:8000/ws/transcribe/test-session-1", help="WebSocket URL")
-    parser.add_argument("--chunk_duration", type=float, default=1, help="Chunk duration in seconds")
+    parser.add_argument("--chunk_duration", type=float, default=0.6, help="Chunk duration in seconds")
     parser.add_argument("--redis", action="store_true", help="Enable Redis monitoring")
     parser.add_argument("--redis_url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"), help="Redis URL")
     

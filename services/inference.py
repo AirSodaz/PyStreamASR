@@ -22,6 +22,7 @@ def load_model() -> AutoModel:
         vad_model="fsmn-vad",
         punc_model="ct-punc",
         device=device,
+        disable_update=True,
     )
     
     print("[Inference] Model loaded successfully.")
