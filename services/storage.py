@@ -3,6 +3,7 @@ import uuid
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 import logging
+import time
 from sqlalchemy import select, text
 from core.config import settings
 from services.schemas import Segment, Session
@@ -45,6 +46,7 @@ class StorageManager:
         """
         async with AsyncSessionLocal() as session:
             async with session.begin():
+                start_time = time.perf_counter()
                 result = await session.execute(select(Session).where(Session.id == self.session_id))
                 existing_session = result.scalar_one_or_none()
 
@@ -57,7 +59,10 @@ class StorageManager:
                     session.add(new_session)
                     logging.info(f"Created new session: {self.session_id}")
                 else:
-                    logging.info(f"Found existing session: {self.session_id}")
+                    logging.debug(f"Found existing session: {self.session_id}")
+
+                duration = time.perf_counter() - start_time
+                logging.debug(f"[Storage] ensure_session_exists took {duration:.6f}s")
 
 
     async def get_next_sequence(self) -> int:
@@ -66,8 +71,12 @@ class StorageManager:
         Returns:
             int: The new sequence number.
         """
+        start_time = time.perf_counter()
         key = f"asr:sess:{self.session_id}:seq"
-        return await redis_client.incr(key)
+        res = await redis_client.incr(key)
+        duration = time.perf_counter() - start_time
+        logging.debug(f"[Storage] Redis INCR took {duration:.6f}s. New Seq: {res}")
+        return res
 
     async def save_partial(self, text: str, seq: int):
         """Saves the partial draft to Redis.
@@ -79,6 +88,7 @@ class StorageManager:
             text (str): The partial transcription text.
             seq (int): The current sequence number.
         """
+        start_time = time.perf_counter()
         key = f"asr:sess:{self.session_id}:current"
         mapping = {
             "content": text,
@@ -89,6 +99,9 @@ class StorageManager:
             pipe.hset(key, mapping=mapping)
             pipe.expire(key, 300)
             await pipe.execute()
+
+        duration = time.perf_counter() - start_time
+        logging.debug(f"[Storage] save_partial (Redis) took {duration:.6f}s")
 
     async def save_final(self, text: str):
         """Persists the final segment to MySQL and clears the Redis draft.
@@ -107,6 +120,8 @@ class StorageManager:
         # 1. Get Sequence
         seq = await self.get_next_sequence()
 
+        start_time = time.perf_counter()
+
         # 2. Prepare Segment
         new_segment = Segment(
             id=str(uuid.uuid4()),
@@ -116,14 +131,30 @@ class StorageManager:
             created_at=datetime.now(timezone.utc)
         )
 
+        # Log params at DEBUG
+        params = {
+            "id": new_segment.id,
+            "session_id": new_segment.session_id,
+            "segment_seq": new_segment.segment_seq,
+            "content": new_segment.content,
+            "created_at": str(new_segment.created_at)
+        }
+        logging.debug(f"[Storage] Inserting Segment params: {params}")
+
         # 3. Insert into MySQL
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 session.add(new_segment)
                 # Commit is implicit with session.begin() context manager upon exit
 
+        db_duration = time.perf_counter() - start_time
+        logging.debug(f"[Storage] save_final (MySQL) took {db_duration:.6f}s")
+
         # 4. Delete Draft from Redis
+        redis_start = time.perf_counter()
         key = f"asr:sess:{self.session_id}:current"
         await redis_client.delete(key)
+        redis_duration = time.perf_counter() - redis_start
+        logging.debug(f"[Storage] Redis DELETE took {redis_duration:.6f}s")
 
         return new_segment

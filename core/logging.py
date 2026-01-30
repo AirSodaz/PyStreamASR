@@ -2,7 +2,15 @@ import logging
 import os
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
-from core.config import settings
+from core.context import session_id_ctx
+
+
+class CorrelationIdFilter(logging.Filter):
+    """Filter that injects the session ID into the log record."""
+
+    def filter(self, record):
+        record.session_id = session_id_ctx.get()
+        return True
 
 
 def setup_logging(settings):
@@ -23,10 +31,13 @@ def setup_logging(settings):
 
     log_path = os.path.join(log_dir, log_filename)
 
-    # Define format
+    # Define format including session_id
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - [%(session_id)s] - %(name)s - %(levelname)s - %(message)s"
     )
+
+    # Filter instance
+    correlation_filter = CorrelationIdFilter()
 
     # File Handler (Daily Rotation)
     file_handler = TimedRotatingFileHandler(
@@ -37,15 +48,18 @@ def setup_logging(settings):
         encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(correlation_filter)
 
     # Console Handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(correlation_filter)
 
     # Root Logger Configuration
     logging.basicConfig(
         level=log_level,
-        handlers=[file_handler, console_handler]
+        handlers=[file_handler, console_handler],
+        force=True
     )
 
     logging.info(f"Logging initialized. Level: {log_level}, File: {log_path}")

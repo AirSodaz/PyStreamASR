@@ -3,6 +3,8 @@ import sherpa_onnx
 import os
 import numpy as np
 import logging
+import time
+import contextvars
 from typing import Tuple, Any
 
 # Define model paths relative to project root
@@ -58,6 +60,7 @@ class ASRInferenceService:
                 - is_final (bool): Whether the segment is considered complete.
         """
         loop = asyncio.get_running_loop()
+        start_time = time.perf_counter()
 
         # Input validation / conversion
         if hasattr(audio_input, "numpy"):
@@ -71,8 +74,10 @@ class ASRInferenceService:
             
         # Ensure flat float32 array
         samples = samples.flatten().astype(np.float32)
+        sample_count = len(samples)
 
         def _blocking_infer():
+            block_start = time.perf_counter()
             self.stream.accept_waveform(16000, samples)
             
             # Decode
@@ -85,9 +90,19 @@ class ASRInferenceService:
             if is_endpoint:
                 self.recognizer.reset(self.stream)
             
-            return text, is_endpoint
+            block_duration = time.perf_counter() - block_start
+            return text, is_endpoint, block_duration
 
-        # Run CPU-bound generation in a separate thread
-        text, is_final = await loop.run_in_executor(None, _blocking_infer)
+        # Run CPU-bound generation in a separate thread with context propagation
+        ctx = contextvars.copy_context()
+        text, is_final, cpu_duration = await loop.run_in_executor(None, ctx.run, _blocking_infer)
+
+        total_duration = time.perf_counter() - start_time
+
+        logging.debug(
+            f"[Inference] Samples: {sample_count}, "
+            f"CPU Time: {cpu_duration:.6f}s, Total Time: {total_duration:.6f}s. "
+            f"Result: {'FINAL' if is_final else 'PARTIAL'}, TextLen: {len(text)}"
+        )
         
         return text.strip(), is_final
