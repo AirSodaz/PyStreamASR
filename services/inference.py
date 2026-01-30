@@ -2,6 +2,7 @@ import asyncio
 import sherpa_onnx
 import os
 import numpy as np
+import logging
 from typing import Tuple, Any
 
 # Define model paths relative to project root
@@ -14,7 +15,7 @@ def load_model() -> sherpa_onnx.OnlineRecognizer:
     Returns:
         sherpa_onnx.OnlineRecognizer: The loaded recognizer instance.
     """
-    print(f"[Inference] Loading Sherpa-onnx model from {MODEL_DIR}...")
+    logging.info(f"Loading Sherpa-onnx model from {MODEL_DIR}...")
     
     encoder = os.path.join(MODEL_DIR, "encoder.int8.onnx")
     decoder = os.path.join(MODEL_DIR, "decoder.int8.onnx")
@@ -35,7 +36,7 @@ def load_model() -> sherpa_onnx.OnlineRecognizer:
         enable_endpoint_detection=True,
     )
     
-    print("[Inference] Model loaded successfully.")
+    logging.info("Model loaded successfully.")
     return recognizer
 
 class ASRInferenceService:

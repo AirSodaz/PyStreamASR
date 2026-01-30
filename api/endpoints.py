@@ -1,4 +1,5 @@
 import json
+import logging
 import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from services.audio import AudioProcessor
@@ -37,7 +38,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         current_seq = int(current_seq_raw) if current_seq_raw else 0
         next_seq = current_seq + 1
 
-        print(f"[WebSocket] Client connected: {session_id}. Start Seq: {next_seq}")
+        logging.info(f"[WebSocket] Client connected: {session_id}. Start Seq: {next_seq}")
 
         # Ensure session exists in DB to satisfy foreign key constraints
         await storage.ensure_session_exists(user_id="websocket_client")
@@ -51,7 +52,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 loop = asyncio.get_running_loop()
                 samples = await loop.run_in_executor(None, processor.process, data)
             except Exception as e:
-                print(f"[WebSocket] Audio processing error: {e}")
+                logging.error(f"[WebSocket] Audio processing error: {e}")
                 continue
 
             # 3. Inference
@@ -90,8 +91,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 })
 
     except WebSocketDisconnect:
-        print(f"[WebSocket] Client disconnected: {session_id}")
+        logging.info(f"[WebSocket] Client disconnected: {session_id}")
     except Exception as e:
-        print(f"[WebSocket] Unexpected error: {e}")
+        logging.error(f"[WebSocket] Unexpected error: {e}")
     finally:
         pass
