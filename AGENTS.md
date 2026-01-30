@@ -19,7 +19,7 @@ This file contains critical context, constraints, and operational commands for t
     * **Hot Data (Partial):** Redis. Key: `asr:sess:{id}:current`.
     * **Cold Data (Final):** MySQL. Table: `segments`.
 * **Audio Pipeline:**
-    * Input: WebSocket -> G.711 (8k) -> PCM (16k) -> FunASR (Paraformer).
+    * Input: WebSocket -> G.711 (8k) -> PCM (16k) -> Sherpa-onnx (Paraformer).
 
 ## 3. Project Structure & File Responsibilities
 
@@ -66,6 +66,21 @@ PyStreamASR/
 * **Libraries:**
     * Use `sqlalchemy` (Async) for MySQL.
     * Use `torchaudio` for resampling.
+
+## 6. Database Schema
+
+* **sessions** (Table):
+    * `id` (PK, String): Unique Session ID.
+    * `user_id` (String): ID of the user.
+    * `created_at` (DateTime): Creation timestamp.
+
+* **segments** (Table):
+    * `id` (PK, String): Unique Segment UUID.
+    * `session_id` (FK, String): Reference to `sessions.id`.
+    * `segment_seq` (Integer): Sequence number.
+    * `content` (Text): Transcribed text.
+    * `created_at` (DateTime): Creation timestamp.
+    * **Indexes:** `idx_session_seq` (session_id, segment_seq).
 
 ---
 **When analyzing issues or writing code, prioritize "Non-blocking I/O" and "Python 3.12 Compatibility".**

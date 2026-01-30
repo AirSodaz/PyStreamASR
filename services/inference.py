@@ -1,74 +1,92 @@
 import asyncio
-import torch
-from funasr import AutoModel
-from typing import Dict, Any, Tuple
+import sherpa_onnx
+import os
+import numpy as np
+from typing import Tuple, Any
 
-def load_model() -> AutoModel:
-    """Loads the FunASR model with VAD and Punctuation support.
+# Define model paths relative to project root
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "sherpa-onnx-streaming-paraformer-bilingual-zh-en")
 
-    Uses CUDA or MPS if available, otherwise falls back to CPU.
+def load_model() -> sherpa_onnx.OnlineRecognizer:
+    """Loads the Sherpa-onnx OnlineRecognizer with Paraformer model.
 
     Returns:
-        AutoModel: The loaded FunASR model instance.
+        sherpa_onnx.OnlineRecognizer: The loaded recognizer instance.
     """
-    device = "cuda" if torch.cuda.is_available() else \
-             "mps" if torch.backends.mps.is_available() else \
-             "cpu"
-    print(f"[Inference] Loading FunASR AutoModel on {device}...")
+    print(f"[Inference] Loading Sherpa-onnx model from {MODEL_DIR}...")
     
-    # Load paraformer-zh-streaming with fsmn-vad and ct-punc
-    model = AutoModel(
-        model="paraformer-zh-streaming",
-        vad_model="fsmn-vad",
-        punc_model="ct-punc",
-        device=device,
-        disable_update=True,
+    encoder = os.path.join(MODEL_DIR, "encoder.int8.onnx")
+    decoder = os.path.join(MODEL_DIR, "decoder.int8.onnx")
+    tokens = os.path.join(MODEL_DIR, "tokens.txt")
+
+    if not os.path.exists(encoder):
+        raise FileNotFoundError(f"Model file not found: {encoder}")
+
+    recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
+        tokens=tokens,
+        encoder=encoder,
+        decoder=decoder,
+        num_threads=4,
+        sample_rate=16000,
+        feature_dim=80,
+        decoding_method="greedy_search",
+        debug=False,
+        enable_endpoint_detection=True,
     )
     
     print("[Inference] Model loaded successfully.")
-    return model
+    return recognizer
 
 class ASRInferenceService:
-    def __init__(self, model: AutoModel):
-        self.model = model
+    def __init__(self, recognizer: sherpa_onnx.OnlineRecognizer):
+        self.recognizer = recognizer
+        self.stream = self.recognizer.create_stream()
 
-    async def infer(self, audio_input: Any, cache: Dict[str, Any]) -> Tuple[str, bool, Dict[str, Any]]:
+    async def infer(self, audio_input: Any) -> Tuple[str, bool]:
         """Runs inference on the provided audio chunk.
 
-        Executes in a thread executor to prevent blocking the asyncio event loop.
-
         Args:
-            audio_input (Any): The prepared audio tensor or bytes.
-            cache (Dict[str, Any]): Dictionary containing model state/context.
+            audio_input (Any): The prepared audio samples (numpy array or tensor).
+                               Examples: np.ndarray (float32), torch.Tensor.
+                               Expected shape: (N,) or (1, N).
 
         Returns:
-            Tuple[str, bool, Dict[str, Any]]: A tuple containing:
+            Tuple[str, bool]: A tuple containing:
                 - text (str): The transcribed text (partial or final).
-                - is_final (bool): Whether the segment is considered complete (e.g., by VAD).
-                - cache (Dict[str, Any]): Updated cache/state.
+                - is_final (bool): Whether the segment is considered complete.
         """
         loop = asyncio.get_running_loop()
 
+        # Input validation / conversion
+        if hasattr(audio_input, "numpy"):
+            samples = audio_input.numpy()
+        elif isinstance(audio_input, np.ndarray):
+            samples = audio_input
+        else:
+            # Fallback/Error - assuming it might be a list or bytes if not careful
+            # But AudioProcessor returns torch.Tensor
+            raise ValueError(f"Unsupported audio input type: {type(audio_input)}")
+            
+        # Ensure flat float32 array
+        samples = samples.flatten().astype(np.float32)
+
         def _blocking_infer():
-            # AutoModel.generate handles the plumbing for streaming if cache is provided.
-            res = self.model.generate(
-                input=audio_input,
-                cache=cache,
-                is_final=False,
-            )
-            return res
+            self.stream.accept_waveform(16000, samples)
+            
+            # Decode
+            while self.recognizer.is_ready(self.stream):
+                self.recognizer.decode_stream(self.stream)
+            
+            text = self.recognizer.get_result(self.stream)
+            is_endpoint = self.recognizer.is_endpoint(self.stream)
+
+            if is_endpoint:
+                self.recognizer.reset(self.stream)
+            
+            return text, is_endpoint
 
         # Run CPU-bound generation in a separate thread
-        res = await loop.run_in_executor(None, _blocking_infer)
+        text, is_final = await loop.run_in_executor(None, _blocking_infer)
         
-        text = ""
-        is_final = False
-
-        # Parse FunASR result
-        # Expected format example: [{'text': '...', 'mode': '2pass-online', 'is_final': True/False, ...}]
-        if res and isinstance(res, list) and len(res) > 0:
-            result_item = res[0]
-            text = result_item.get("text", "")
-            is_final = result_item.get("is_final", False)
-        
-        return text, is_final, cache
+        return text.strip(), is_final

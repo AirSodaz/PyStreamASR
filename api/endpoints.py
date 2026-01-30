@@ -25,8 +25,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     # Initialize components
     processor = AudioProcessor()
     storage = StorageManager(session_id)
-    # Param dict for model cache (streaming context)
-    param_dict = {}
 
     # Get global model from app state
     model = websocket.app.state.model
@@ -41,20 +39,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
         print(f"[WebSocket] Client connected: {session_id}. Start Seq: {next_seq}")
 
+        # Ensure session exists in DB to satisfy foreign key constraints
+        await storage.ensure_session_exists(user_id="websocket_client")
+
         while True:
             # 1. Receive Audio Bytes
             data = await websocket.receive_bytes()
 
-            # 2. Process Audio (G.711 -> PCM -> Tensor)
+            # 2. Process Audio (G.711 -> PCM -> Samples)
             try:
                 loop = asyncio.get_running_loop()
-                tensor = await loop.run_in_executor(None, processor.process, data)
+                samples = await loop.run_in_executor(None, processor.process, data)
             except Exception as e:
                 print(f"[WebSocket] Audio processing error: {e}")
                 continue
 
             # 3. Inference
-            text, is_final, param_dict = await inference_service.infer(tensor, param_dict)
+            text, is_final = await inference_service.infer(samples)
 
             if not text:
                 continue

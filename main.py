@@ -6,7 +6,8 @@ import logging
 setup_logging(settings)
 
 from services.inference import load_model
-from services.storage import check_database_connections
+from services.storage import check_database_connections, engine
+from services.schemas import Base
 from api.endpoints import router as api_router
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -19,6 +20,11 @@ async def lifespan(app: FastAPI):
     
     # Check Database Connections
     await check_database_connections()
+
+    # Create Tables
+    logging.info("Initializing Database Tables...")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     yield
     # Cleanup on shutdown if needed

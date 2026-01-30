@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 import logging
 from sqlalchemy import select, text
 from core.config import settings
-from services.schemas import Segment
+from services.schemas import Segment, Session
 
 # Database Setup
 engine = create_async_engine(settings.MYSQL_DATABASE_URL, echo=False)
@@ -36,6 +36,29 @@ async def check_database_connections():
 class StorageManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
+
+    async def ensure_session_exists(self, user_id: str = "anonymous"):
+        """Ensures the session exists in the database. If not, creates it.
+
+        Args:
+            user_id (str): The user ID associated with the session. Defaults to "anonymous".
+        """
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                result = await session.execute(select(Session).where(Session.id == self.session_id))
+                existing_session = result.scalar_one_or_none()
+
+                if not existing_session:
+                    new_session = Session(
+                        id=self.session_id,
+                        user_id=user_id,
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    session.add(new_session)
+                    logging.info(f"Created new session: {self.session_id}")
+                else:
+                    logging.info(f"Found existing session: {self.session_id}")
+
 
     async def get_next_sequence(self) -> int:
         """Atomically increments the sequence counter for this session in Redis.

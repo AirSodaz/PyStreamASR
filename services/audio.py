@@ -1,13 +1,12 @@
 import g711
 import numpy as np
-import torch
-import torchaudio
 
 
 class AudioProcessor:
     def __init__(self):
-        # Initialize resampler: 8000Hz -> 16000Hz
-        self.resampler = torchaudio.transforms.Resample(orig_freq=8000, new_freq=16000)
+        # Target sample rate
+        self.target_rate = 16000
+        self.source_rate = 8000
 
     def decode_g711(self, data: bytes) -> np.ndarray:
         """Decodes G.711 A-law bytes to PCM (int16 or float32).
@@ -28,30 +27,38 @@ class AudioProcessor:
         # Convert bytes to numpy array of int16
         return np.frombuffer(decoded, dtype=np.int16)
 
-    def resample(self, pcm_data: np.ndarray) -> torch.Tensor:
-        """Resamples 8000Hz PCM data to 16000Hz.
+    def resample(self, pcm_data: np.ndarray) -> np.ndarray:
+        """Resamples 8000Hz PCM data to 16000Hz using linear interpolation.
 
         Args:
             pcm_data (np.ndarray): The input PCM data as a numpy array of float32.
 
         Returns:
-            torch.Tensor: The resampled waveform as a float32 tensor.
+            np.ndarray: The resampled waveform as a float32 array.
         """
-        # Convert numpy array to torch tensor
-        waveform = torch.from_numpy(pcm_data)
+        if self.source_rate == self.target_rate:
+            return pcm_data
 
-        # Resampler expects (channel, time) or (time)
-        resampled_waveform = self.resampler(waveform)
-        return resampled_waveform
+        duration_sec = len(pcm_data) / self.source_rate
+        target_len = int(duration_sec * self.target_rate)
 
-    def process(self, chunk: bytes) -> torch.Tensor:
+        # Create time points for input and output
+        x_old = np.linspace(0, duration_sec, len(pcm_data))
+        x_new = np.linspace(0, duration_sec, target_len)
+        
+        # Linear interpolation
+        resampled = np.interp(x_new, x_old, pcm_data)
+        
+        return resampled.astype(np.float32)
+
+    def process(self, chunk: bytes) -> np.ndarray:
         """Full pipeline: Decode G.711 -> Normalize -> Resample.
 
         Args:
             chunk (bytes): The input audio chunk in G.711 A-law format.
 
         Returns:
-            torch.Tensor: A Float32 Tensor normalized to the [-1, 1] range.
+            np.ndarray: A Float32 array normalized to the [-1, 1] range.
         """
         # 1. Decode
         pcm_data = self.decode_g711(chunk)
@@ -61,5 +68,5 @@ class AudioProcessor:
         if pcm_data.dtype == np.int16:
             pcm_data = pcm_data.astype(np.float32) / 32768.0
 
-        # 3. Resample using the class method
+        # 3. Resample
         return self.resample(pcm_data)
