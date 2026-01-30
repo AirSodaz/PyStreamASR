@@ -1,12 +1,15 @@
 import json
 import logging
 import asyncio
+import time
+import contextvars
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from services.audio import AudioProcessor
 from services.storage import StorageManager
 from services.inference import ASRInferenceService
 from services.storage import redis_client
 from core.config import settings
+from core.context import session_id_ctx
 
 router = APIRouter()
 
@@ -21,7 +24,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         websocket (WebSocket): The WebSocket connection instance.
         session_id (str): Unique identifier for the transcription session.
     """
+    # Set correlation ID context
+    token = session_id_ctx.set(session_id)
+
     await websocket.accept()
+    logging.info(f"[WebSocket] Connection accepted for session: {session_id}")
 
     # Initialize components
     processor = AudioProcessor()
@@ -45,12 +52,19 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
         while True:
             # 1. Receive Audio Bytes
-            data = await websocket.receive_bytes()
+            try:
+                data = await websocket.receive_bytes()
+            except WebSocketDisconnect:
+                raise
+            except Exception as e:
+                logging.error(f"[WebSocket] Receive error: {e}")
+                break
 
             # 2. Process Audio (G.711 -> PCM -> Samples)
             try:
                 loop = asyncio.get_running_loop()
-                samples = await loop.run_in_executor(None, processor.process, data)
+                ctx = contextvars.copy_context()
+                samples = await loop.run_in_executor(None, ctx.run, processor.process, data)
             except Exception as e:
                 logging.error(f"[WebSocket] Audio processing error: {e}")
                 continue
@@ -78,6 +92,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     "text": text,
                     "seq": response_seq
                 })
+                logging.info(f"[WebSocket] Sent FINAL: {text} (Seq: {response_seq})")
 
             else:
                 # 4. Save Partial
@@ -89,10 +104,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     "text": text,
                     "seq": next_seq
                 })
+                logging.debug(f"[WebSocket] Sent PARTIAL: {text} (Seq: {next_seq})")
 
     except WebSocketDisconnect:
         logging.info(f"[WebSocket] Client disconnected: {session_id}")
     except Exception as e:
-        logging.error(f"[WebSocket] Unexpected error: {e}")
+        logging.error(f"[WebSocket] Unexpected error: {e}", exc_info=True)
     finally:
-        pass
+        logging.info(f"[WebSocket] Connection closed: {session_id}")
+        session_id_ctx.reset(token)
