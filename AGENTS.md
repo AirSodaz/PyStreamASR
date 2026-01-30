@@ -19,7 +19,7 @@ This file contains critical context, constraints, and operational commands for t
     * **Hot Data (Partial):** Redis. Key: `asr:sess:{id}:current`.
     * **Cold Data (Final):** MySQL. Table: `segments`.
 * **Audio Pipeline:**
-    * Input: WebSocket -> G.711 (8k) -> PCM (16k) -> Sherpa-onnx (Paraformer).
+    * Input: WebSocket -> G.711 (8k) -> PCM (16k) -> Sherpa-onnx (Paraformer-Streaming).
 
 ## 3. Project Structure & File Responsibilities
 
@@ -33,8 +33,6 @@ PyStreamASR/
 ├── core/
 │   ├── __init__.py
 │   └── config.py             # Pydantic Settings, Env loading, & Constants.
-├── models/
-│   └── __init__.py
 ├── services/
 │   ├── __init__.py
 │   ├── audio.py              # AudioProcessor class (G.711 decoding, Resampling).
@@ -65,7 +63,6 @@ PyStreamASR/
     * Ensure DB sessions are closed in `finally` blocks.
 * **Libraries:**
     * Use `sqlalchemy` (Async) for MySQL.
-    * Use `torchaudio` for resampling.
 
 ## 6. Database Schema
 
