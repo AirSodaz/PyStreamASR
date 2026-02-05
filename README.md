@@ -56,12 +56,25 @@ LOG_DIR="logs"
 
 ### Running the Server
 
-Start the FastAPI server with Uvicorn (development mode):
+**Development mode:**
 
 ```bash
 uvicorn main:app --reload
 ```
-The server will start at `http://127.0.0.1:8000`.
+
+**Production mode (Uvicorn):**
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+**Production mode (Gunicorn):**
+
+```bash
+gunicorn main:app -c gunicorn.conf.py
+```
+
+The server will start at `http://localhost:8000`.
 
 ### Running the Simulation Script
 

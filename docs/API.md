@@ -26,10 +26,7 @@ This endpoint supports session continuity—reconnecting with the same `session_
 
 ### Request Headers
 
-| Header      | Value             | Required | Description                          |
-|-------------|-------------------|----------|--------------------------------------|
-| `Upgrade`   | `websocket`       | Yes      | Standard WebSocket upgrade header.   |
-| `Connection`| `Upgrade`         | Yes      | Standard WebSocket connection header.|
+WebSocket connections follow the standard HTTP upgrade handshake ([RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455)). No custom headers are required.
 
 ---
 
@@ -122,7 +119,7 @@ import asyncio
 import websockets
 
 async def stream_audio():
-    uri = "ws://localhost:8000/ws/transcribe/session-001"
+    uri = "ws://localhost:8000/ws/transcribe/user-123-session-456"
     async with websockets.connect(uri) as ws:
         # Send G.711 audio bytes
         with open("audio.g711", "rb") as f:

@@ -10,3 +10,4 @@ aiomysql
 asyncmy
 pydantic-settings
 python-dotenv
+gunicorn
