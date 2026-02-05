@@ -68,11 +68,13 @@ uvicorn main:app --reload
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
-**Production mode (Gunicorn):**
+**Production mode (Gunicorn - Linux/macOS only):**
 
 ```bash
 gunicorn main:app -c gunicorn.conf.py
 ```
+
+> **Note:** Gunicorn does not support Windows. On Windows, use Uvicorn directly or deploy via Docker/WSL.
 
 The server will start at `http://localhost:8000`.
 
