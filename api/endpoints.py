@@ -50,6 +50,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Ensure session exists in DB to satisfy foreign key constraints
         await storage.ensure_session_exists(user_id="websocket_client")
 
+        # Track state for disconnection handling
+        last_text: str = ""
+        last_is_final: bool = True
+
         while True:
             # 1. Receive Audio Bytes
             try:
@@ -71,6 +75,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             # 3. Inference
             text, is_final = await inference_service.infer(samples)
+
+            # Update tracking state
+            if text:
+                last_text = text
+                last_is_final = is_final
 
             if not text:
                 continue
@@ -111,5 +120,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     except Exception as e:
         logging.error(f"[WebSocket] Unexpected error: {e}", exc_info=True)
     finally:
+        # Check if we have a pending partial result that needs to be finalized
+        if last_text and not last_is_final:
+            logging.info(
+                f"[WebSocket] Connection closed with pending partial. Finalizing: '{last_text}'"
+            )
+            try:
+                # Save as final
+                saved_segment = await storage.save_final(last_text)
+                if saved_segment:
+                    logging.info(f"[WebSocket] Auto-finalized segment seq: {saved_segment.segment_seq}")
+            except Exception as e:
+                logging.error(f"[WebSocket] Failed to auto-finalize pending text: {e}")
+
         logging.info(f"[WebSocket] Connection closed: {session_id}")
         session_id_ctx.reset(token)
