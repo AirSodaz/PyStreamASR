@@ -8,7 +8,13 @@ class AudioProcessor:
     def __init__(self):
         # Target sample rate
         self.target_rate = 16000
-        self.source_rate = 8000
+        
+        # --- CONFIGURATION (Manual Switch) ---
+        # Format: "g711" (default) or "pcm16"
+        self.input_format = "g711" 
+        # Source Sample Rate: 8000 for G.711, 16000 for typical PCM, etc.
+        self.source_rate = 8000  
+        # -------------------------------------
 
     def decode_g711(self, data: bytes) -> np.ndarray:
         """Decodes G.711 A-law bytes to PCM (int16 or float32).
@@ -36,7 +42,7 @@ class AudioProcessor:
         return result
 
     def resample(self, pcm_data: np.ndarray) -> np.ndarray:
-        """Resamples 8000Hz PCM data to 16000Hz using linear interpolation.
+        """Resamples source_rate PCM data to target_rate using linear interpolation.
 
         Args:
             pcm_data (np.ndarray): The input PCM data as a numpy array of float32.
@@ -65,23 +71,28 @@ class AudioProcessor:
         return result
 
     def process(self, chunk: bytes) -> np.ndarray:
-        """Full pipeline: Decode G.711 -> Normalize -> Resample.
+        """Full pipeline: Decode (G.711/PCM) -> Normalize -> Resample.
 
         Args:
-            chunk (bytes): The input audio chunk in G.711 A-law format.
+            chunk (bytes): The input audio chunk.
 
         Returns:
             np.ndarray: A Float32 array normalized to the [-1, 1] range.
         """
         process_start = time.perf_counter()
         input_len = len(chunk)
-        logging.debug(f"[Audio] Processing chunk of size {input_len} bytes")
+        logging.debug(f"[Audio] Processing chunk of size {input_len} bytes, fmt={self.input_format}")
 
-        # 1. Decode
-        pcm_data = self.decode_g711(chunk)
+        # 1. Decode / Load
+        if self.input_format == "pcm16":
+            # Input is raw Int16 PCM bytes
+            pcm_data = np.frombuffer(chunk, dtype=np.int16)
+        else:
+            # Default to G.711 A-law
+            pcm_data = self.decode_g711(chunk)
 
-        # 2. Normalize to [-1, 1] only if it was integer data
-        # If g711 returned float array, it is already normalized [-1, 1]
+        # 2. Normalize to [-1, 1]
+        # Whether from G.711 decode (if int16) or direct PCM16 load, we normalise here.
         if pcm_data.dtype == np.int16:
             pcm_data = pcm_data.astype(np.float32) / 32768.0
 
