@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     MODEL_PATH: str
     LOG_LEVEL: str = "INFO"
     LOG_DIR: str = "logs"
+    RETURN_TRANSCRIPTION: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

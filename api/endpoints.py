@@ -96,24 +96,30 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     next_seq += 1
 
                 # 5. Feedback (Final)
-                await websocket.send_json({
-                    "type": "final",
-                    "text": text,
-                    "seq": response_seq
-                })
-                logging.info(f"[WebSocket] Sent FINAL: {text} (Seq: {response_seq})")
+                if settings.RETURN_TRANSCRIPTION:
+                    await websocket.send_json({
+                        "type": "final",
+                        "text": text,
+                        "seq": response_seq
+                    })
+                    logging.info(f"[WebSocket] Sent FINAL: {text} (Seq: {response_seq})")
+                else:
+                    logging.info(f"[WebSocket] Tracking FINAL: {text} (Seq: {response_seq}) (Response Disabled)")
 
             else:
                 # 4. Save Partial
                 await storage.save_partial(text, next_seq)
 
                 # 5. Feedback (Partial)
-                await websocket.send_json({
-                    "type": "partial",
-                    "text": text,
-                    "seq": next_seq
-                })
-                logging.debug(f"[WebSocket] Sent PARTIAL: {text} (Seq: {next_seq})")
+                if settings.RETURN_TRANSCRIPTION:
+                    await websocket.send_json({
+                        "type": "partial",
+                        "text": text,
+                        "seq": next_seq
+                    })
+                    logging.debug(f"[WebSocket] Sent PARTIAL: {text} (Seq: {next_seq})")
+                else:
+                    logging.debug(f"[WebSocket] Tracking PARTIAL: {text} (Seq: {next_seq}) (Response Disabled)")
 
     except WebSocketDisconnect:
         logging.info(f"[WebSocket] Client disconnected: {session_id}")
