@@ -36,6 +36,9 @@ def load_model() -> sherpa_onnx.OnlineRecognizer:
         decoding_method="greedy_search",
         debug=False,
         enable_endpoint_detection=True,
+        rule1_min_trailing_silence=3.0,
+        rule2_min_trailing_silence=1.2,
+        rule3_min_utterance_length=300.0,
     )
     
     logging.info("Model loaded successfully.")
