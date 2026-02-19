@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import uuid
+import asyncio
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 import logging
@@ -108,19 +109,16 @@ class StorageManager:
 
         1. Generates UUID.
         2. Gets next sequence number.
-        3. Persists to MySQL `Segment` table.
-        4. Deletes the 'current' draft from Redis.
+        3. Schedules MySQL insertion and Redis draft deletion in a background task.
 
         Args:
             text (str): The final transcription text.
 
         Returns:
-            Segment: The saved segment object.
+            Segment: The prepared segment object (not yet persisted).
         """
-        # 1. Get Sequence
+        # 1. Get Sequence (Still await this as it's fast and needed for response)
         seq = await self.get_next_sequence()
-
-        start_time = time.perf_counter()
 
         # 2. Prepare Segment
         new_segment = Segment(
@@ -139,22 +137,32 @@ class StorageManager:
             "content": new_segment.content,
             "created_at": str(new_segment.created_at)
         }
-        logging.debug(f"[Storage] Inserting Segment params: {params}")
+        logging.debug(f"[Storage] Scheduling background save for Segment: {params}")
 
-        # 3. Insert into MySQL
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                session.add(new_segment)
-                # Commit is implicit with session.begin() context manager upon exit
+        # 3. Define background persistence task
+        async def _persist_segment():
+            try:
+                # 3a. Insert into MySQL
+                start_time = time.perf_counter()
+                async with AsyncSessionLocal() as session:
+                    async with session.begin():
+                        session.add(new_segment)
+                db_duration = time.perf_counter() - start_time
+                logging.debug(f"[Storage] Background MySQL insert took {db_duration:.6f}s")
 
-        db_duration = time.perf_counter() - start_time
-        logging.debug(f"[Storage] save_final (MySQL) took {db_duration:.6f}s")
+                # 3b. Delete Draft from Redis
+                redis_start = time.perf_counter()
+                key = f"asr:sess:{self.session_id}:current"
+                await redis_client.delete(key)
+                redis_duration = time.perf_counter() - redis_start
+                logging.debug(f"[Storage] Background Redis DELETE took {redis_duration:.6f}s")
+            except Exception as e:
+                logging.error(
+                    f"[Storage] Background persistence failed for session {self.session_id}: {e}",
+                    exc_info=True
+                )
 
-        # 4. Delete Draft from Redis
-        redis_start = time.perf_counter()
-        key = f"asr:sess:{self.session_id}:current"
-        await redis_client.delete(key)
-        redis_duration = time.perf_counter() - redis_start
-        logging.debug(f"[Storage] Redis DELETE took {redis_duration:.6f}s")
+        # 4. Fire and forget
+        asyncio.create_task(_persist_segment())
 
         return new_segment
