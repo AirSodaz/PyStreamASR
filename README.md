@@ -78,6 +78,20 @@ gunicorn main:app -c gunicorn.conf.py
 
 The server will start at `http://localhost:8000`.
 
+### Checking Service Status
+
+To quickly verify that the service is running and the model is loaded, you can check the `/health` endpoint:
+
+```bash
+curl http://localhost:8000/health
+```
+
+**Expected Output:**
+
+```json
+{"status":"ok","config":"loaded","project_name":"PyStreamASR","model_status":"loaded"}
+```
+
 ### Running the Simulation Script
 
 A test script is provided to simulate a client streaming audio to the server and verify real-time transcription.
