@@ -76,7 +76,9 @@ class ASRInferenceService:
             raise ValueError(f"Unsupported audio input type: {type(audio_input)}")
             
         # Ensure flat float32 array
-        samples = samples.flatten().astype(np.float32)
+        # Optimization: Avoid copy if already flat float32
+        if samples.dtype != np.float32 or samples.ndim != 1 or not samples.flags["C_CONTIGUOUS"]:
+            samples = samples.flatten().astype(np.float32)
         sample_count = len(samples)
 
         def _blocking_infer():
