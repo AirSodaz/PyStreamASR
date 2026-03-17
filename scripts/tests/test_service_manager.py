@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import logging
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -51,7 +52,15 @@ class ServiceManagerTests(unittest.TestCase):
             state_file=self.state_file,
             log_file=self.log_file,
             python_executable="python",
+            platform_name="nt",
         )
+        self.addCleanup(self.close_controller_logger)
+
+    def close_controller_logger(self) -> None:
+        """Close file handlers so the temporary directory can be removed on Windows."""
+        for handler in list(self.controller.logger.handlers):
+            handler.close()
+            self.controller.logger.removeHandler(handler)
 
     def override_method(self, obj: object, name: str, value: object) -> None:
         """Temporarily replace an instance or module attribute."""
@@ -59,7 +68,7 @@ class ServiceManagerTests(unittest.TestCase):
         self.addCleanup(setattr, obj, name, original_value)
         setattr(obj, name, value)
 
-    def create_state(self, pid: int = 4321) -> service_manager.ServiceState:
+    def create_state(self, pid: int = 4321, runtime: str = "uvicorn") -> service_manager.ServiceState:
         """Build a consistent test state object."""
         return service_manager.ServiceState(
             pid=pid,
@@ -68,6 +77,7 @@ class ServiceManagerTests(unittest.TestCase):
             workers=1,
             started_at="2026-03-17T00:00:00+00:00",
             launch_command=["python", "-m", "uvicorn", "main:app"],
+            runtime=runtime,
             process_creation_date="20260317000000.000000+000",
             log_file=str(self.log_file),
         )
@@ -146,6 +156,7 @@ class ServiceManagerTests(unittest.TestCase):
         """Starting an already-running managed service should not spawn again."""
         running_status = service_manager.ServiceStatus(
             status="running",
+            configured_runtime="uvicorn",
             configured_host="0.0.0.0",
             configured_port=8000,
             configured_workers=1,
@@ -165,6 +176,53 @@ class ServiceManagerTests(unittest.TestCase):
         self.override_method(service_manager.subprocess, "Popen", unexpected_popen)
         message = self.controller.start_service()
         self.assertIn("already running", message)
+        self.assertIn("already running", self.log_file.read_text(encoding="utf-8"))
+
+    def test_start_service_does_not_capture_application_logs(self) -> None:
+        """Managed startup should not redirect child stdout/stderr into manager logs."""
+        self.override_method(
+            self.controller,
+            "get_service_status",
+            lambda: service_manager.ServiceStatus(
+                status="stopped",
+                configured_runtime="uvicorn",
+                configured_host="0.0.0.0",
+                configured_port=8000,
+                configured_workers=1,
+                pid=None,
+                pid_alive=False,
+                health_ok=False,
+                health_url=None,
+                active_state=None,
+                detail="Service is not running.",
+            ),
+        )
+        self.override_method(
+            self.controller,
+            "get_process_info",
+            lambda pid: {"CreationDate": "20260317000000.000000+000"},
+        )
+
+        captured_kwargs: dict[str, object] = {}
+
+        class FakeProcess:
+            pid = 2468
+
+        def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
+            captured_kwargs.update(kwargs)
+            return FakeProcess()
+
+        self.override_method(service_manager.subprocess, "Popen", fake_popen)
+
+        message = self.controller.start_service()
+
+        self.assertIn("PID 2468", message)
+        self.assertEqual(captured_kwargs["stdout"], service_manager.subprocess.DEVNULL)
+        self.assertEqual(captured_kwargs["stderr"], service_manager.subprocess.DEVNULL)
+        self.assertTrue(self.log_file.exists())
+        log_contents = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("Starting managed uvicorn service", log_contents)
+        self.assertIn("Service start requested for PID 2468", log_contents)
 
     def test_restart_replaces_saved_state(self) -> None:
         """Restart should replace old process metadata with the new state."""
@@ -187,6 +245,67 @@ class ServiceManagerTests(unittest.TestCase):
         self.assertEqual(current_state.pid, 2222)
         self.assertIn("stopped", message)
         self.assertIn("started", message)
+
+    def test_build_command_uses_gunicorn_on_posix(self) -> None:
+        """macOS/Linux should launch gunicorn with explicit bind and workers."""
+        controller = service_manager.ServiceController(
+            root_dir=self.root_dir,
+            env_file=self.env_file,
+            state_file=self.state_file,
+            log_file=self.log_file,
+            python_executable=str(self.root_dir / "venv" / "bin" / "python"),
+            platform_name="posix",
+        )
+        self.addCleanup(self.close_logger, controller.logger)
+
+        command = controller.build_command(controller.load_settings())
+
+        self.assertEqual(command[0], "gunicorn")
+        self.assertEqual(
+            command[1:],
+            [
+                "main:app",
+                "-c",
+                str(self.root_dir / "gunicorn.conf.py"),
+                "--bind",
+                "0.0.0.0:8000",
+                "--workers",
+                "1",
+            ],
+        )
+
+    def test_is_managed_process_accepts_gunicorn_state(self) -> None:
+        """Saved gunicorn state should validate against the current process metadata."""
+        controller = service_manager.ServiceController(
+            root_dir=self.root_dir,
+            env_file=self.env_file,
+            state_file=self.state_file,
+            log_file=self.log_file,
+            python_executable="python",
+            platform_name="posix",
+        )
+        self.addCleanup(self.close_logger, controller.logger)
+
+        state = self.create_state(pid=9999, runtime="gunicorn")
+        state.launch_command = ["gunicorn", "main:app", "-c", str(self.root_dir / "gunicorn.conf.py")]
+        state.process_creation_date = "Thu Mar 18 01:23:45 2026"
+
+        self.override_method(
+            controller,
+            "get_process_info",
+            lambda pid: {
+                "CommandLine": "gunicorn main:app -c gunicorn.conf.py --bind 0.0.0.0:8000 --workers 1",
+                "CreationDate": "Thu Mar 18 01:23:45 2026",
+            },
+        )
+
+        self.assertTrue(controller.is_managed_process(state))
+
+    def close_logger(self, logger: logging.Logger) -> None:
+        """Close handlers for an arbitrary logger instance."""
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
 
 
 if __name__ == "__main__":

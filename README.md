@@ -70,7 +70,7 @@ APP_WORKERS=1
 | `AUDIO_SOURCE_RATE` | No | `8000` | `8000` or `16000`. Must match the stream sample rate sent by clients. |
 | `APP_HOST` | No | `0.0.0.0` | Bind host used by the terminal service manager. |
 | `APP_PORT` | No | `8000` | Bind port used by the terminal service manager. |
-| `APP_WORKERS` | No | `1` | Uvicorn worker count used by the terminal service manager. |
+| `APP_WORKERS` | No | `1` | Worker count used by the terminal service manager. On Windows this applies to Uvicorn; on macOS/Linux it applies to Gunicorn. |
 
 ## Usage
 
@@ -82,13 +82,21 @@ APP_WORKERS=1
 uvicorn main:app --reload
 ```
 
-**Windows terminal service manager:**
+**Terminal service manager:**
 
 ```powershell
 .\scripts\manage_service.bat
 ```
 
-This opens a numbered terminal menu for viewing status, starting, stopping, restarting, and updating `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`.
+On Windows, this opens a numbered terminal menu that manages the service with Uvicorn and updates `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`.
+
+On macOS/Linux, use:
+
+```bash
+./scripts/manage_service.sh
+```
+
+The same TUI is used, but it starts the service with Gunicorn plus `gunicorn.conf.py`, while still applying `APP_HOST`, `APP_PORT`, and `APP_WORKERS` from `.env`.
 
 **Production mode (Uvicorn):**
 

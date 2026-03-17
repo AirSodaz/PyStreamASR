@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -37,7 +38,7 @@ MENU_OPTIONS = (
 
 @dataclass(slots=True)
 class ServiceState:
-    """Persisted metadata for the managed Uvicorn process."""
+    """Persisted metadata for the managed service process."""
 
     pid: int
     host: str
@@ -45,6 +46,7 @@ class ServiceState:
     workers: int
     started_at: str
     launch_command: list[str]
+    runtime: str = "uvicorn"
     process_creation_date: str | None = None
     log_file: str | None = None
 
@@ -54,6 +56,7 @@ class ServiceStatus:
     """Current status information for the managed service."""
 
     status: str
+    configured_runtime: str
     configured_host: str
     configured_port: int
     configured_workers: int
@@ -66,7 +69,7 @@ class ServiceStatus:
 
 
 class ServiceController:
-    """Manage the local Uvicorn process and persisted runtime configuration."""
+    """Manage the local service process and persisted runtime configuration."""
 
     def __init__(
         self,
@@ -75,6 +78,7 @@ class ServiceController:
         state_file: Path = DEFAULT_STATE_FILE,
         log_file: Path = DEFAULT_LOG_FILE,
         python_executable: str | None = None,
+        platform_name: str | None = None,
     ) -> None:
         """Initialize the controller.
 
@@ -82,14 +86,32 @@ class ServiceController:
             root_dir: Project root used as the subprocess working directory.
             env_file: Environment file used for runtime settings persistence.
             state_file: JSON file storing the managed process metadata.
-            log_file: Log file capturing the managed service stdout/stderr.
-            python_executable: Interpreter used to launch Uvicorn.
+            log_file: Log file used for service-manager control events.
+            python_executable: Interpreter used to launch the managed server.
+            platform_name: Optional platform override for testing.
         """
         self.root_dir = root_dir
         self.env_file = env_file
         self.state_file = state_file
         self.log_file = log_file
         self.python_executable = python_executable or sys.executable
+        self.platform_name = platform_name or os.name
+        self.logger = self._build_logger()
+
+    def _build_logger(self) -> logging.Logger:
+        """Create a dedicated file logger for service-manager events."""
+        logger_name = f"service_manager.{self.log_file.resolve()}"
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        if not logger.handlers:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(self.log_file, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+            logger.addHandler(handler)
+
+        return logger
 
     def load_settings(self) -> Settings:
         """Load the latest runtime settings from the environment file."""
@@ -99,10 +121,12 @@ class ServiceController:
         """Inspect current runtime state and health information."""
         settings = self.load_settings()
         state = self.load_state()
+        configured_runtime = self.get_runtime_name()
 
         if state is None:
             return ServiceStatus(
                 status="stopped",
+                configured_runtime=configured_runtime,
                 configured_host=settings.APP_HOST,
                 configured_port=settings.APP_PORT,
                 configured_workers=settings.APP_WORKERS,
@@ -118,6 +142,7 @@ class ServiceController:
             self.clear_state()
             return ServiceStatus(
                 status="stopped",
+                configured_runtime=configured_runtime,
                 configured_host=settings.APP_HOST,
                 configured_port=settings.APP_PORT,
                 configured_workers=settings.APP_WORKERS,
@@ -133,6 +158,7 @@ class ServiceController:
             self.clear_state()
             return ServiceStatus(
                 status="stopped",
+                configured_runtime=configured_runtime,
                 configured_host=settings.APP_HOST,
                 configured_port=settings.APP_PORT,
                 configured_workers=settings.APP_WORKERS,
@@ -141,7 +167,7 @@ class ServiceController:
                 health_ok=False,
                 health_url=None,
                 active_state=None,
-                detail="Saved PID no longer belongs to the managed Uvicorn process.",
+                detail=f"Saved PID no longer belongs to the managed {state.runtime} process.",
             )
 
         health_url = self.build_health_url(state.host, state.port)
@@ -151,6 +177,7 @@ class ServiceController:
 
         return ServiceStatus(
             status=status,
+            configured_runtime=configured_runtime,
             configured_host=settings.APP_HOST,
             configured_port=settings.APP_PORT,
             configured_workers=settings.APP_WORKERS,
@@ -163,25 +190,33 @@ class ServiceController:
         )
 
     def start_service(self) -> str:
-        """Start the managed Uvicorn service if it is not already running."""
+        """Start the managed service if it is not already running."""
         status = self.get_service_status()
         if status.pid_alive:
+            self.logger.info("Start skipped because service is already running with PID %s.", status.pid)
             return f"Service is already running with PID {status.pid}."
 
         settings = self.load_settings()
+        runtime = self.get_runtime_name()
         command = self.build_command(settings)
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.logger.info(
+            "Starting managed %s service with host=%s port=%s workers=%s.",
+            runtime,
+            settings.APP_HOST,
+            settings.APP_PORT,
+            settings.APP_WORKERS,
+        )
 
-        with self.log_file.open("a", encoding="utf-8") as log_handle:
-            process = subprocess.Popen(
-                command,
-                cwd=self.root_dir,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                creationflags=self.get_creation_flags(),
-            )
+        process = subprocess.Popen(
+            command,
+            cwd=self.root_dir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=self.get_creation_flags(),
+        )
 
         process_info = self.get_process_info(process.pid)
         state = ServiceState(
@@ -191,48 +226,65 @@ class ServiceController:
             workers=settings.APP_WORKERS,
             started_at=datetime.now(UTC).isoformat(),
             launch_command=command,
+            runtime=runtime,
             process_creation_date=process_info.get("CreationDate") if process_info else None,
             log_file=str(self.log_file),
         )
         self.save_state(state)
+        self.logger.info("Service start requested for PID %s.", process.pid)
         return (
-            f"Service start requested. PID {process.pid}, host {settings.APP_HOST}, "
+            f"Service start requested via {runtime}. PID {process.pid}, host {settings.APP_HOST}, "
             f"port {settings.APP_PORT}, workers {settings.APP_WORKERS}."
         )
 
     def stop_service(self) -> str:
-        """Stop the managed Uvicorn service if it is running."""
+        """Stop the managed service if it is running."""
         state = self.load_state()
         if state is None:
+            self.logger.info("Stop skipped because service is already stopped.")
             return "Service is already stopped."
 
         if not self.is_pid_running(state.pid):
             self.clear_state()
+            self.logger.info("Cleared stale service state for PID %s during stop.", state.pid)
             return "Service is already stopped. Cleared stale state."
 
         if not self.is_managed_process(state):
             self.clear_state()
-            return "Saved PID did not match the managed Uvicorn process. Cleared state without stopping another process."
+            self.logger.warning(
+                "Saved PID %s did not match the managed %s process.",
+                state.pid,
+                state.runtime,
+            )
+            return (
+                f"Saved PID did not match the managed {state.runtime} process. "
+                "Cleared state without stopping another process."
+            )
 
         if self.send_graceful_stop(state.pid):
             if self.wait_for_exit(state.pid, timeout_seconds=5.0):
                 self.clear_state()
+                self.logger.info("Service stopped gracefully for PID %s.", state.pid)
                 return f"Service stopped gracefully for PID {state.pid}."
 
-        self.taskkill(state.pid, force=False)
+        self.stop_process(state.pid, force=False)
         if self.wait_for_exit(state.pid, timeout_seconds=5.0):
             self.clear_state()
+            self.logger.info("Service stopped for PID %s using a terminate signal.", state.pid)
             return f"Service stopped for PID {state.pid}."
 
-        self.taskkill(state.pid, force=True)
+        self.stop_process(state.pid, force=True)
         if self.wait_for_exit(state.pid, timeout_seconds=5.0):
             self.clear_state()
+            self.logger.warning("Service force-stopped for PID %s.", state.pid)
             return f"Service force-stopped for PID {state.pid}."
 
+        self.logger.error("Failed to stop service PID %s.", state.pid)
         return f"Failed to stop service PID {state.pid}. Check {self.log_file} for details."
 
     def restart_service(self) -> str:
         """Restart the managed service using the latest persisted configuration."""
+        self.logger.info("Restart requested.")
         stop_message = self.stop_service()
         if self.get_service_status().pid_alive:
             return stop_message
@@ -244,18 +296,21 @@ class ServiceController:
         """Validate and persist a new host value."""
         normalized_host = self.validate_host(raw_value)
         self.persist_env_value("APP_HOST", normalized_host)
+        self.logger.info("Updated APP_HOST to %s.", normalized_host)
         return f"Host updated to {normalized_host}."
 
     def update_port(self, raw_value: str) -> str:
         """Validate and persist a new port value."""
         normalized_port = self.validate_port(raw_value)
         self.persist_env_value("APP_PORT", str(normalized_port))
+        self.logger.info("Updated APP_PORT to %s.", normalized_port)
         return f"Port updated to {normalized_port}."
 
     def update_workers(self, raw_value: str) -> str:
         """Validate and persist a new worker count."""
         normalized_workers = self.validate_workers(raw_value)
         self.persist_env_value("APP_WORKERS", str(normalized_workers))
+        self.logger.info("Updated APP_WORKERS to %s.", normalized_workers)
         return f"Workers updated to {normalized_workers}."
 
     def load_state(self) -> ServiceState | None:
@@ -283,24 +338,58 @@ class ServiceController:
             self.state_file.unlink()
 
     def build_command(self, settings: Settings) -> list[str]:
-        """Build the Uvicorn command line for the configured runtime."""
+        """Build the server command line for the configured runtime."""
+        if self.is_windows_platform():
+            return [
+                self.python_executable,
+                "-m",
+                "uvicorn",
+                "main:app",
+                "--host",
+                settings.APP_HOST,
+                "--port",
+                str(settings.APP_PORT),
+                "--workers",
+                str(settings.APP_WORKERS),
+            ]
+
         return [
-            self.python_executable,
-            "-m",
-            "uvicorn",
+            self.resolve_gunicorn_executable(),
             "main:app",
-            "--host",
-            settings.APP_HOST,
-            "--port",
-            str(settings.APP_PORT),
+            "-c",
+            str(self.root_dir / "gunicorn.conf.py"),
+            "--bind",
+            f"{settings.APP_HOST}:{settings.APP_PORT}",
             "--workers",
             str(settings.APP_WORKERS),
         ]
 
     def get_creation_flags(self) -> int:
-        """Return Windows subprocess flags for a dedicated process group."""
+        """Return subprocess flags for a dedicated process group when supported."""
+        if not self.is_windows_platform():
+            return 0
         create_new_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return create_new_process_group
+
+    def get_runtime_name(self) -> str:
+        """Return the server runtime for the current platform."""
+        return "uvicorn" if self.is_windows_platform() else "gunicorn"
+
+    def get_runtime_display_name(self) -> str:
+        """Return a human-friendly runtime name for the current platform."""
+        return self.get_runtime_name().capitalize()
+
+    def is_windows_platform(self) -> bool:
+        """Return whether the controller is running on Windows."""
+        return self.platform_name == "nt"
+
+    def resolve_gunicorn_executable(self) -> str:
+        """Resolve the gunicorn executable from the active virtual environment when available."""
+        python_path = Path(self.python_executable)
+        gunicorn_path = python_path.with_name("gunicorn")
+        if gunicorn_path.exists():
+            return str(gunicorn_path)
+        return "gunicorn"
 
     def persist_env_value(self, key: str, value: str) -> None:
         """Update or append a key in the environment file."""
@@ -327,51 +416,82 @@ class ServiceController:
 
     def is_pid_running(self, pid: int) -> bool:
         """Check whether a PID currently exists."""
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        output = result.stdout.strip()
-        return bool(output) and "No tasks are running" not in output and "INFO:" not in output
+        if self.is_windows_platform():
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            output = result.stdout.strip()
+            return bool(output) and "No tasks are running" not in output and "INFO:" not in output
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
 
     def get_process_info(self, pid: int) -> dict[str, str] | None:
         """Return command-line metadata for the target PID."""
-        command = (
-            f"$process = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
-            "if ($null -eq $process) { return }; "
-            "$process | Select-Object CommandLine, CreationDate | ConvertTo-Json -Compress"
-        )
+        if self.is_windows_platform():
+            command = (
+                f"$process = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+                "if ($null -eq $process) { return }; "
+                "$process | Select-Object CommandLine, CreationDate | ConvertTo-Json -Compress"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            output = result.stdout.strip()
+            if result.returncode != 0 or not output:
+                return None
+
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                return None
+
+            if not isinstance(payload, dict):
+                return None
+
+            command_line = payload.get("CommandLine")
+            creation_date = payload.get("CreationDate")
+            normalized_payload: dict[str, str] = {}
+            if isinstance(command_line, str):
+                normalized_payload["CommandLine"] = command_line
+            if isinstance(creation_date, str):
+                normalized_payload["CreationDate"] = creation_date
+            return normalized_payload or None
+
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
+            ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
             capture_output=True,
             text=True,
             check=False,
         )
-        output = result.stdout.strip()
-        if result.returncode != 0 or not output:
+        output_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if result.returncode != 0 or not output_lines:
             return None
 
-        try:
-            payload = json.loads(output)
-        except json.JSONDecodeError:
+        parts = output_lines[0].split(None, 5)
+        if len(parts) < 6:
             return None
 
-        if not isinstance(payload, dict):
-            return None
-
-        command_line = payload.get("CommandLine")
-        creation_date = payload.get("CreationDate")
-        normalized_payload: dict[str, str] = {}
-        if isinstance(command_line, str):
-            normalized_payload["CommandLine"] = command_line
-        if isinstance(creation_date, str):
-            normalized_payload["CreationDate"] = creation_date
-        return normalized_payload or None
+        return {
+            "CreationDate": " ".join(parts[:5]),
+            "CommandLine": parts[5],
+        }
 
     def is_managed_process(self, state: ServiceState) -> bool:
-        """Verify that the saved PID still points to the managed Uvicorn process."""
+        """Verify that the saved PID still points to the managed service process."""
         process_info = self.get_process_info(state.pid)
         if process_info is None:
             return False
@@ -381,26 +501,43 @@ class ServiceController:
         if state.process_creation_date and creation_date != state.process_creation_date:
             return False
 
-        return "-m uvicorn" in command_line and "main:app" in command_line
+        runtime = state.runtime or self.get_runtime_name()
+        if runtime == "gunicorn":
+            return "gunicorn" in command_line and "main:app" in command_line
+        return "uvicorn" in command_line and "main:app" in command_line
 
     def send_graceful_stop(self, pid: int) -> bool:
-        """Attempt a graceful stop using a Windows console control signal."""
+        """Attempt a graceful stop using the platform's preferred signal."""
+        if not self.is_windows_platform():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                return True
+            except OSError:
+                return False
+
         ctrl_break_event = getattr(signal, "CTRL_BREAK_EVENT", None)
         if ctrl_break_event is None:
             return False
-
         try:
             os.kill(pid, ctrl_break_event)
             return True
         except OSError:
             return False
 
-    def taskkill(self, pid: int, force: bool) -> None:
-        """Stop a process tree using Windows taskkill."""
-        command = ["taskkill", "/PID", str(pid), "/T"]
-        if force:
-            command.insert(1, "/F")
-        subprocess.run(command, capture_output=True, text=True, check=False)
+    def stop_process(self, pid: int, force: bool) -> None:
+        """Stop a managed process using platform-appropriate tooling."""
+        if self.is_windows_platform():
+            command = ["taskkill", "/PID", str(pid), "/T"]
+            if force:
+                command.insert(1, "/F")
+            subprocess.run(command, capture_output=True, text=True, check=False)
+            return
+
+        stop_signal = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.kill(pid, stop_signal)
+        except OSError:
+            return
 
     def wait_for_exit(self, pid: int, timeout_seconds: float) -> bool:
         """Wait for a process to exit within the given timeout."""
@@ -468,7 +605,7 @@ class ServiceController:
 
 def clear_screen() -> None:
     """Clear the active terminal window."""
-    os.system("cls")
+    os.system("cls" if os.name == "nt" else "clear")
 
 
 def prompt_for_value(prompt: str) -> str:
@@ -480,6 +617,7 @@ def format_status(status: ServiceStatus) -> list[str]:
     """Format status information for display in the menu."""
     lines = [
         f"Status: {status.status}",
+        f"Configured runtime: {status.configured_runtime}",
         f"Configured host: {status.configured_host}",
         f"Configured port: {status.configured_port}",
         f"Configured workers: {status.configured_workers}",
@@ -489,6 +627,7 @@ def format_status(status: ServiceStatus) -> list[str]:
         lines.extend(
             [
                 f"Managed PID: {status.active_state.pid}",
+                f"Active runtime: {status.active_state.runtime}",
                 f"Active host: {status.active_state.host}",
                 f"Active port: {status.active_state.port}",
                 f"Active workers: {status.active_state.workers}",
@@ -505,11 +644,11 @@ def format_status(status: ServiceStatus) -> list[str]:
 
 def run_menu(controller: ServiceController) -> None:
     """Run the interactive terminal menu."""
-    message = "Service manager ready."
+    message = f"Service manager ready for {controller.get_runtime_display_name()}."
 
     while True:
         clear_screen()
-        print("PyStreamASR Service Manager")
+        print(f"PyStreamASR Service Manager ({controller.get_runtime_display_name()})")
         print("=" * 28)
         print()
         for line in format_status(controller.get_service_status()):
