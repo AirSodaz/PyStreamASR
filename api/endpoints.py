@@ -1,16 +1,56 @@
-import json
-import logging
 import asyncio
-import time
 import contextvars
+import logging
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from services.audio import AudioProcessor
+import numpy as np
+
+from services.audio import (
+    AudioProcessor,
+    DebugAudioWriter,
+    append_debug_audio_samples,
+    close_debug_audio_writer,
+    is_debug_audio_enabled,
+)
 from services.storage import StorageManager
 from services.inference import ASRInferenceService
 from core.config import settings
 from core.context import session_id_ctx
 
 router = APIRouter()
+
+
+async def _append_debug_audio(
+    loop: asyncio.AbstractEventLoop,
+    writer: DebugAudioWriter | None,
+    session_id: str,
+    samples: np.ndarray,
+) -> DebugAudioWriter | None:
+    """Persist processed audio samples without blocking the event loop."""
+    append_ctx = contextvars.copy_context()
+    return await loop.run_in_executor(
+        None,
+        append_ctx.run,
+        append_debug_audio_samples,
+        writer,
+        session_id,
+        samples,
+    )
+
+
+async def _close_debug_audio_writer(
+    loop: asyncio.AbstractEventLoop,
+    writer: DebugAudioWriter | None,
+) -> None:
+    """Close a debug-audio writer without blocking the event loop."""
+    if writer is None:
+        return
+
+    try:
+        close_ctx = contextvars.copy_context()
+        await loop.run_in_executor(None, close_ctx.run, close_debug_audio_writer, writer)
+    except Exception as exc:
+        logging.error(f"[WebSocket] Failed to close debug audio writer: {exc}")
 
 
 @router.websocket("/ws/transcribe/{session_id}")
@@ -36,20 +76,21 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     # Get global model from app state
     model = websocket.app.state.model
     inference_service = ASRInferenceService(model)
+    last_text: str = ""
+    last_is_final: bool = True
+    debug_audio_writer: DebugAudioWriter | None = None
+    debug_audio_enabled = is_debug_audio_enabled()
 
     try:
         # Determine current sequence number to handle reconnections or continuations
         current_seq = await storage.get_current_sequence()
         next_seq = current_seq + 1
+        loop = asyncio.get_running_loop()
 
         logging.info(f"[WebSocket] Client connected: {session_id}. Start Seq: {next_seq}")
 
         # Ensure session exists in DB to satisfy foreign key constraints
         await storage.ensure_session_exists(user_id="websocket_client")
-
-        # Track state for disconnection handling
-        last_text: str = ""
-        last_is_final: bool = True
 
         while True:
             # 1. Receive Audio Bytes
@@ -63,12 +104,19 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             # 2. Process Audio (G.711 -> PCM -> Samples)
             try:
-                loop = asyncio.get_running_loop()
                 ctx = contextvars.copy_context()
                 samples = await loop.run_in_executor(None, ctx.run, processor.process, data)
             except Exception as e:
                 logging.error(f"[WebSocket] Audio processing error: {e}")
                 continue
+
+            if debug_audio_enabled:
+                debug_audio_writer = await _append_debug_audio(
+                    loop=loop,
+                    writer=debug_audio_writer,
+                    session_id=session_id,
+                    samples=samples,
+                )
 
             # 3. Inference
             text, is_final = await inference_service.infer(samples)
@@ -123,6 +171,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     except Exception as e:
         logging.error(f"[WebSocket] Unexpected error: {e}", exc_info=True)
     finally:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
         # Check if we have a pending partial result that needs to be finalized
         if last_text and not last_is_final:
             logging.info(
@@ -135,6 +188,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     logging.info(f"[WebSocket] Auto-finalized segment seq: {saved_segment.segment_seq}")
             except Exception as e:
                 logging.error(f"[WebSocket] Failed to auto-finalize pending text: {e}")
+
+        if debug_audio_enabled and loop is not None:
+            await _close_debug_audio_writer(loop, debug_audio_writer)
 
         logging.info(f"[WebSocket] Connection closed: {session_id}")
         session_id_ctx.reset(token)

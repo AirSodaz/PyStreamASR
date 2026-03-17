@@ -63,7 +63,7 @@ APP_WORKERS=1
 | `MYSQL_DATABASE_URL` | Yes | None | SQLAlchemy DSN. Example: `mysql+aiomysql://user:password@host/dbname`. |
 | `MODEL_PATH` | Yes | None | Model directory path. Can be absolute or project-relative. |
 | `PROJECT_NAME` | No | `PyStreamASR` | Any string. Used in app title and `/health`. |
-| `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. When set to `DEBUG`, processed connection audio is also saved as WAV files under `logs/debug_audio/`. |
 | `LOG_DIR` | No | `logs` | Directory for log files. |
 | `RETURN_TRANSCRIPTION` | No | `true` | `true` or `false`. When `false`, server will still process but will not return transcription messages on WebSocket. |
 | `AUDIO_INPUT_FORMAT` | No | `alaw` | `alaw`, `ulaw`, `pcm16le`. Must match the stream format sent by clients. |
@@ -105,6 +105,8 @@ gunicorn main:app -c gunicorn.conf.py
 > **Note:** Gunicorn does not support Windows. On Windows, use Uvicorn directly or deploy via Docker/WSL.
 
 The server will start at `http://localhost:8000`.
+
+When running with `LOG_LEVEL=DEBUG`, each WebSocket connection also writes a mono 16 kHz PCM WAV artifact to `logs/debug_audio/` so developers can inspect the decoded/resampled audio sent into ASR.
 
 ### Checking Service Status
 
