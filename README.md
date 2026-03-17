@@ -1,3 +1,5 @@
+**English** | [中文](README_zh.md)
+
 # PyStreamASR
 
 PyStreamASR is a real-time Automatic Speech Recognition (ASR) streaming service built with Python 3.12 and FastAPI. It leverages **Sherpa-onnx** (Paraformer Streaming) for high-performance, low-latency speech-to-text transcription suitable for real-time applications.
