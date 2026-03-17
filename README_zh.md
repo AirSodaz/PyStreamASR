@@ -120,6 +120,33 @@ sudo systemctl start pystreamasr
 sudo journalctl -u pystreamasr -n 100 --no-pager
 ```
 
+**Windows 计划任务部署:**
+
+如果需要在 Windows 上通过任务计划程序进行常驻后台部署，请运行：
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+该安装流程适用于已安装 `py.exe` 且可通过 `py -3.12` 访问 Python 3.12、已完成配置的 `.env`，以及已放置到 `models/` 目录或 `MODEL_PATH` 所指定位置的模型文件的 Windows 主机。安装脚本会校验 `.env`、创建或复用项目根目录下的 `venv`、安装依赖、注册一个在当前用户登录时自动启动 Uvicorn 的 `PyStreamASR` 计划任务、立即启动一次该任务，并验证 `http://127.0.0.1:APP_PORT/health`。
+
+支持的安装参数：
+
+```powershell
+.\install.ps1 -TaskName PyStreamASR -EnvFile .env -Force
+```
+
+`.env` 必须已经包含 `MYSQL_DATABASE_URL`、`MODEL_PATH`、`APP_HOST`、`APP_PORT` 和 `APP_WORKERS`。安装器会将任务的标准输出和错误输出分别写入 `logs/scheduled_task.stdout.log` 与 `logs/scheduled_task.stderr.log`。
+
+安装完成后的常用命令：
+
+```powershell
+Get-ScheduledTask -TaskName "PyStreamASR" | Get-ScheduledTaskInfo
+Start-ScheduledTask -TaskName "PyStreamASR"
+Stop-ScheduledTask -TaskName "PyStreamASR"
+Unregister-ScheduledTask -TaskName "PyStreamASR" -Confirm:$false
+```
+
 **生产模式 (Uvicorn):**
 
 ```bash

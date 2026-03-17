@@ -120,6 +120,33 @@ sudo systemctl start pystreamasr
 sudo journalctl -u pystreamasr -n 100 --no-pager
 ```
 
+**Windows scheduled task deployment:**
+
+For a persistent Windows background task managed by Task Scheduler, run:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+This install path is intended for Windows hosts with `py.exe` plus Python 3.12 available, a populated `.env`, and downloaded model files already available under `models/` or at the configured `MODEL_PATH`. The installer validates `.env`, creates or reuses the repo-local `venv`, installs dependencies, registers a per-user `PyStreamASR` scheduled task that launches Uvicorn at logon, starts it once immediately, and verifies `http://127.0.0.1:APP_PORT/health`.
+
+Supported installer parameters:
+
+```powershell
+.\install.ps1 -TaskName PyStreamASR -EnvFile .env -Force
+```
+
+`.env` must already contain `MYSQL_DATABASE_URL`, `MODEL_PATH`, `APP_HOST`, `APP_PORT`, and `APP_WORKERS`. The installer writes task stdout and stderr to `logs/scheduled_task.stdout.log` and `logs/scheduled_task.stderr.log`.
+
+Common operations after install:
+
+```powershell
+Get-ScheduledTask -TaskName "PyStreamASR" | Get-ScheduledTaskInfo
+Start-ScheduledTask -TaskName "PyStreamASR"
+Stop-ScheduledTask -TaskName "PyStreamASR"
+Unregister-ScheduledTask -TaskName "PyStreamASR" -Confirm:$false
+```
+
 **Production mode (Uvicorn):**
 
 ```bash
