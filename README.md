@@ -23,21 +23,27 @@ PyStreamASR is a real-time Automatic Speech Recognition (ASR) streaming service 
 
 ## Installation
 
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/AirSodaz/PyStreamASR.git
-    cd PyStreamASR
-    ```
-    
-2.  **Install dependencies**:
-    
-    ```bash
-    pip install -r requirements.txt
-    ```
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/AirSodaz/PyStreamASR.git
+   cd PyStreamASR
+   ```
 
-3.  **Download Models**:
-    Ensure the Sherpa-onnx models are placed in the `models/` directory.
-    *   Example: `models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/`
+2. **Create a virtual environment and install dependencies**
+   ```powershell
+   py -3.12 -m venv venv
+   .\venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+3. **Create `.env` and set the required values**
+   Copy `.env.example` to `.env`, then set at least:
+   - `MYSQL_DATABASE_URL`
+   - `MODEL_PATH`
+
+4. **Download the Sherpa-onnx model**
+   Place the model directory under `models/`, for example:
+   - `models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/`
 
 ## Configuration
 
@@ -76,128 +82,57 @@ APP_WORKERS=1
 
 ## Usage
 
-### Running the Server
+### Quick Start
 
-**Development mode:**
+Start the server in development mode:
 
 ```bash
 uvicorn main:app --reload
 ```
 
-**Terminal service manager:**
-
-```powershell
-.\scripts\manage_service.bat
-```
-
-On Windows, this opens a numbered terminal menu that manages the service with Uvicorn and updates `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`.
-
-On macOS/Linux, use:
-
-```bash
-./scripts/manage_service.sh
-```
-
-The same TUI is used, but it starts the service with Gunicorn plus `gunicorn.conf.py`, while still applying `APP_HOST`, `APP_PORT`, and `APP_WORKERS` from `.env`.
-
-**Linux systemd deployment:**
-
-For a persistent Linux service managed by `systemd`, run:
-
-```bash
-sudo ./install.sh
-```
-
-This install path is intended for Linux hosts with `systemd`, `python3.12`, a populated `.env`, and downloaded model files already available under `models/` or at the configured `MODEL_PATH`. The installer validates `.env`, creates or reuses the repo-local `venv`, installs dependencies, renders `/etc/systemd/system/pystreamasr.service`, then enables and starts the service.
-
-Common operations after install:
-
-```bash
-sudo systemctl status pystreamasr --no-pager
-sudo systemctl restart pystreamasr
-sudo systemctl stop pystreamasr
-sudo systemctl start pystreamasr
-sudo journalctl -u pystreamasr -n 100 --no-pager
-```
-
-**Windows scheduled task deployment:**
-
-For a persistent Windows background task managed by Task Scheduler, run:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-This install path is intended for Windows hosts with `py.exe` plus Python 3.12 available, a populated `.env`, and downloaded model files already available under `models/` or at the configured `MODEL_PATH`. The installer validates `.env`, creates or reuses the repo-local `venv`, installs dependencies, registers a per-user `PyStreamASR` scheduled task that launches Uvicorn at logon, starts it once immediately, and verifies `http://127.0.0.1:APP_PORT/health`.
-
-Supported installer parameters:
-
-```powershell
-.\install.ps1 -TaskName PyStreamASR -EnvFile .env -Force
-```
-
-`.env` must already contain `MYSQL_DATABASE_URL`, `MODEL_PATH`, `APP_HOST`, `APP_PORT`, and `APP_WORKERS`. The installer writes task stdout and stderr to `logs/scheduled_task.stdout.log` and `logs/scheduled_task.stderr.log`.
-
-Common operations after install:
-
-```powershell
-Get-ScheduledTask -TaskName "PyStreamASR" | Get-ScheduledTaskInfo
-Start-ScheduledTask -TaskName "PyStreamASR"
-Stop-ScheduledTask -TaskName "PyStreamASR"
-Unregister-ScheduledTask -TaskName "PyStreamASR" -Confirm:$false
-```
-
-**Production mode (Uvicorn):**
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-**Production mode (Gunicorn - Linux/macOS only):**
-
-```bash
-gunicorn main:app -c gunicorn.conf.py
-```
-
-> **Note:** Gunicorn does not support Windows. On Windows, use Uvicorn directly or deploy via Docker/WSL.
-
-The server will start at `http://localhost:8000`.
-
-When running with `LOG_LEVEL=DEBUG`, each WebSocket connection also writes a mono 16 kHz PCM WAV artifact to `logs/debug_audio/` so developers can inspect the decoded/resampled audio sent into ASR.
-
-### Checking Service Status
-
-To quickly verify that the service is running and the model is loaded, you can check the `/health` endpoint:
+Check readiness:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-**Expected Output:**
+Expected response:
 
 ```json
 {"status":"ok","config":"loaded","project_name":"PyStreamASR","model_status":"loaded"}
 ```
 
-### Running the Simulation Script
-
-A test script is provided to simulate a client streaming audio to the server and verify real-time transcription.
+Run the streaming simulator:
 
 ```bash
 python scripts/simulate_stream.py --file path/to/audio.wav --host ws://127.0.0.1:8000/ws/transcribe/test-session-1
 ```
 
-**Arguments:**
-*   `--file`: Input audio file path. Supported:
-    *   Raw G.711: `.alaw`, `.pcma`, `.g711`, `.ulaw`, `.pcmu`, `.mulaw` (must match `--format`).
-    *   Raw PCM16LE: `.pcm`, `.raw` (requires `--format pcm16le`).
-    *   WAV:
-        *   G.711 A-law/μ-law WAV is passed through (format must match `--format`).
-        *   PCM WAV/other audio is loaded and converted to the stream format using `librosa`.
-*   `--host`: WebSocket URL (default: `ws://localhost:8000/ws/transcribe/test-session-1`).
-*   `--chunk_duration`: Duration per chunk in seconds (default: `0.6`). Controls chunk size and sleep interval to simulate real-time streaming.
-*   `--format`: Stream encoding format: `alaw`, `ulaw`, or `pcm16le` (default: `alaw`).
-*   `--sample_rate`: Stream sample rate: `8000` or `16000` (default: `8000`). G.711 is typically `8000`.
+Common simulator options:
+- `--format`: `alaw`, `ulaw`, or `pcm16le`
+- `--sample_rate`: `8000` or `16000`
+- `--chunk_duration`: chunk size and send interval in seconds
+
+### Service and Deployment Options
+
+| Scenario | Command | Notes |
+| --- | --- | --- |
+| Local service manager (Windows) | `.\scripts\manage_service.bat` | Opens a TUI and updates `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`. |
+| Local service manager (macOS/Linux) | `./scripts/manage_service.sh` | Same TUI for Unix-like environments. |
+| Persistent Linux service | `sudo ./install.sh` | Creates or reuses `venv`, installs dependencies, registers `pystreamasr.service`, and installs the `pystreamasr` helper command. |
+| Persistent Windows service | `powershell.exe -ExecutionPolicy Bypass -File .\install.ps1` | Creates or reuses `venv`, registers the `PyStreamASR` scheduled task, and installs the `pystreamasr` helper command. |
+| Direct production run | `uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4` | Cross-platform production entry point. |
+| Gunicorn (Linux/macOS only) | `gunicorn main:app -c gunicorn.conf.py` | Gunicorn is not supported on Windows. |
+
+After running either installer, use:
+
+```bash
+pystreamasr
+```
+
+Use `sudo pystreamasr` on Linux if `systemctl` requires elevated privileges.
+
+When `LOG_LEVEL=DEBUG`, each WebSocket connection also writes a mono 16 kHz PCM WAV file to `logs/debug_audio/` for audio inspection.
 
 ## Project Structure
 

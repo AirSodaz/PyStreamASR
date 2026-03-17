@@ -211,6 +211,111 @@ function ConvertTo-SingleQuotedLiteral {
     return $Value.Replace("'", "''")
 }
 
+function Write-ServiceInstallMetadata {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Backend,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Runtime,
+
+        [Parameter()]
+        [string]$InstallMode = "service"
+    )
+
+    $parentDirectory = Split-Path -Path $Path -Parent
+    New-Item -Path $parentDirectory -ItemType Directory -Force | Out-Null
+
+    $payload = @{
+        backend      = $Backend
+        service_name = $ServiceName
+        runtime      = $Runtime
+        install_mode = $InstallMode
+    } | ConvertTo-Json
+
+    Set-Content -LiteralPath $Path -Value $payload -Encoding UTF8
+}
+
+function Get-WindowsConsoleEntryPoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptsDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PythonExecutable
+    )
+
+    $entryPointExecutable = Join-Path -Path $ScriptsDirectory -ChildPath "pystreamasr.exe"
+    if (Test-Path -LiteralPath $entryPointExecutable -PathType Leaf) {
+        return "@echo off`r`n`"$entryPointExecutable`" %*`r`n"
+    }
+
+    $entryPointScript = Join-Path -Path $ScriptsDirectory -ChildPath "pystreamasr-script.py"
+    if (Test-Path -LiteralPath $entryPointScript -PathType Leaf) {
+        return "@echo off`r`n`"$PythonExecutable`" `"$entryPointScript`" %*`r`n"
+    }
+
+    Throw-InstallError "Could not find the generated pystreamasr console entry point under $ScriptsDirectory"
+}
+
+function Ensure-UserPathContains {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $pathEntries = @()
+    if (-not [string]::IsNullOrWhiteSpace($currentUserPath)) {
+        $pathEntries = $currentUserPath.Split(";", [System.StringSplitOptions]::RemoveEmptyEntries)
+    }
+
+    foreach ($existingEntry in $pathEntries) {
+        if ([string]::Equals($existingEntry.Trim(), $Directory, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (-not ($env:Path.Split(";", [System.StringSplitOptions]::RemoveEmptyEntries) -contains $Directory)) {
+                $env:Path = "$Directory;$env:Path"
+            }
+            return
+        }
+    }
+
+    $updatedUserPath = if ([string]::IsNullOrWhiteSpace($currentUserPath)) {
+        $Directory
+    }
+    else {
+        "$currentUserPath;$Directory"
+    }
+
+    [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
+    $env:Path = "$Directory;$env:Path"
+}
+
+function Install-PyStreamASRLauncher {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptsDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PythonExecutable
+    )
+
+    $launcherDirectory = Join-Path -Path $env:LOCALAPPDATA -ChildPath "PyStreamASR\bin"
+    New-Item -Path $launcherDirectory -ItemType Directory -Force | Out-Null
+
+    $wrapperPath = Join-Path -Path $launcherDirectory -ChildPath "pystreamasr.cmd"
+    $wrapperContent = Get-WindowsConsoleEntryPoint -ScriptsDirectory $ScriptsDirectory -PythonExecutable $PythonExecutable
+    Set-Content -LiteralPath $wrapperPath -Value $wrapperContent -Encoding ASCII
+
+    Ensure-UserPathContains -Directory $launcherDirectory
+    return $wrapperPath
+}
+
 function Register-PyStreamASRTask {
     param(
         [Parameter(Mandatory = $true)]
@@ -332,15 +437,19 @@ function Wait-ForHealthEndpoint {
 $rootDir = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $envFilePath = Resolve-ProjectPath -Path $EnvFile
 $requirementsPath = Join-Path -Path $rootDir -ChildPath "requirements.txt"
+$pyprojectPath = Join-Path -Path $rootDir -ChildPath "pyproject.toml"
 $mainPath = Join-Path -Path $rootDir -ChildPath "main.py"
 $venvDir = Join-Path -Path $rootDir -ChildPath "venv"
 $venvPython = Join-Path -Path $venvDir -ChildPath "Scripts\python.exe"
+$venvScriptsDir = Join-Path -Path $venvDir -ChildPath "Scripts"
 $logsDir = Join-Path -Path $rootDir -ChildPath "logs"
 $stdoutLog = Join-Path -Path $logsDir -ChildPath "scheduled_task.stdout.log"
 $stderrLog = Join-Path -Path $logsDir -ChildPath "scheduled_task.stderr.log"
+$installMetadataPath = Join-Path -Path $logsDir -ChildPath "service_install.json"
 
 Assert-FileExists -Path $envFilePath -Description ".env file"
 Assert-FileExists -Path $requirementsPath -Description "requirements.txt"
+Assert-FileExists -Path $pyprojectPath -Description "pyproject.toml"
 Assert-FileExists -Path $mainPath -Description "main.py"
 
 $settingsMap = Get-EnvSettings -Path $envFilePath
@@ -372,6 +481,10 @@ Register-PyStreamASRTask `
     -AppWorkers $runtimeConfig.AppWorkers `
     -Force:$Force.IsPresent
 
+Invoke-CheckedCommand -FilePath $venvPython -Arguments @("-m", "pip", "install", "--no-deps", "-e", $rootDir) -Description "Installing PyStreamASR console entry point"
+$launcherPath = Install-PyStreamASRLauncher -ScriptsDirectory $venvScriptsDir -PythonExecutable $venvPython
+Write-ServiceInstallMetadata -Path $installMetadataPath -Backend "scheduled_task" -ServiceName $TaskName -Runtime "uvicorn"
+
 Write-Log "Starting scheduled task '$TaskName'"
 Start-ScheduledTask -TaskName $TaskName
 $healthUri = Wait-ForHealthEndpoint -Port $runtimeConfig.AppPort -StdoutLog $stdoutLog -StderrLog $stderrLog
@@ -383,6 +496,8 @@ $healthUri = Wait-ForHealthEndpoint -Port $runtimeConfig.AppPort -StdoutLog $std
 [install] Health: $healthUri
 [install] Stdout log: $stdoutLog
 [install] Stderr log: $stderrLog
+[install] Console command: $launcherPath
+[install] Install metadata: $installMetadataPath
 [install] Task status: Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo
 [install] Start task: Start-ScheduledTask -TaskName '$TaskName'
 [install] Stop task: Stop-ScheduledTask -TaskName '$TaskName'

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import tempfile
 import unittest
-import logging
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -20,8 +20,18 @@ from core.config import get_settings
 import service_manager
 
 
+class FakeCompletedProcess:
+    """Minimal completed-process stub for backend command tests."""
+
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+        """Store command results."""
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
 class ServiceManagerTests(unittest.TestCase):
-    """Test runtime configuration and process-state behavior."""
+    """Test runtime configuration and installed-service behavior."""
 
     def setUp(self) -> None:
         """Create an isolated workspace for each test."""
@@ -34,6 +44,7 @@ class ServiceManagerTests(unittest.TestCase):
 
         self.env_file = self.root_dir / ".env"
         self.state_file = self.logs_dir / "service_state.json"
+        self.metadata_file = self.logs_dir / "service_install.json"
         self.log_file = self.logs_dir / "service_manager.log"
         self.env_file.write_text(
             "\n".join(
@@ -47,21 +58,26 @@ class ServiceManagerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.controller = service_manager.ServiceController(
+        self.controller = self.build_controller(platform_name="nt")
+        self.addCleanup(self.close_logger, self.controller.logger)
+
+    def build_controller(self, platform_name: str) -> service_manager.ServiceController:
+        """Create a controller bound to the temporary test workspace."""
+        return service_manager.ServiceController(
             root_dir=self.root_dir,
             env_file=self.env_file,
             state_file=self.state_file,
             log_file=self.log_file,
             python_executable="python",
-            platform_name="nt",
+            platform_name=platform_name,
+            install_metadata_file=self.metadata_file,
         )
-        self.addCleanup(self.close_controller_logger)
 
-    def close_controller_logger(self) -> None:
-        """Close file handlers so the temporary directory can be removed on Windows."""
-        for handler in list(self.controller.logger.handlers):
+    def close_logger(self, logger: logging.Logger) -> None:
+        """Close handlers so the temporary directory can be removed on Windows."""
+        for handler in list(logger.handlers):
             handler.close()
-            self.controller.logger.removeHandler(handler)
+            logger.removeHandler(handler)
 
     def override_method(self, obj: object, name: str, value: object) -> None:
         """Temporarily replace an instance or module attribute."""
@@ -69,18 +85,42 @@ class ServiceManagerTests(unittest.TestCase):
         self.addCleanup(setattr, obj, name, original_value)
         setattr(obj, name, value)
 
-    def create_state(self, pid: int = 4321, runtime: str = "uvicorn") -> service_manager.ServiceState:
-        """Build a consistent test state object."""
-        return service_manager.ServiceState(
-            pid=pid,
-            host="0.0.0.0",
-            port=8000,
-            workers=1,
-            started_at="2026-03-17T00:00:00+00:00",
-            launch_command=["python", "-m", "uvicorn", "main:app"],
-            runtime=runtime,
-            process_creation_date="20260317000000.000000+000",
-            log_file=str(self.log_file),
+    def write_metadata(self, backend: str, service_name: str, runtime: str) -> None:
+        """Persist install metadata for the active controller."""
+        self.controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=backend,
+                service_name=service_name,
+                runtime=runtime,
+            )
+        )
+
+    def make_status(
+        self,
+        *,
+        status: str,
+        backend: str,
+        service_name: str,
+        runtime: str,
+    ) -> service_manager.ServiceStatus:
+        """Build a status object for action-dispatch tests."""
+        return service_manager.ServiceStatus(
+            status=status,
+            configured_runtime=runtime,
+            configured_host="0.0.0.0",
+            configured_port=8000,
+            configured_workers=1,
+            pid=None,
+            pid_alive=status in {"running", "degraded"},
+            health_ok=status == "running",
+            health_url="http://127.0.0.1:8000/health" if status in {"running", "degraded"} else None,
+            active_state=service_manager.ServiceState(
+                backend=backend,
+                service_name=service_name,
+                runtime=runtime,
+                manager_state=status,
+            ),
+            detail="status detail",
         )
 
     def test_settings_default_runtime_values(self) -> None:
@@ -121,237 +161,301 @@ class ServiceManagerTests(unittest.TestCase):
 
         self.assertEqual(self.env_file.read_text(encoding="utf-8"), original_contents)
 
-    def test_stale_state_is_treated_as_stopped(self) -> None:
-        """A dead PID should be cleared and reported as stopped."""
-        self.controller.save_state(self.create_state())
-        self.override_method(self.controller, "is_pid_running", lambda pid: False)
+    def test_install_metadata_round_trip(self) -> None:
+        """Installer metadata should persist and reload cleanly."""
+        metadata = service_manager.InstallMetadata(
+            backend=service_manager.WINDOWS_BACKEND,
+            service_name="CustomTask",
+            runtime="uvicorn",
+        )
+
+        self.controller.save_install_metadata(metadata)
+
+        loaded_metadata = self.controller.get_install_metadata()
+        self.assertEqual(loaded_metadata.backend, metadata.backend)
+        self.assertEqual(loaded_metadata.service_name, metadata.service_name)
+        self.assertEqual(loaded_metadata.runtime, metadata.runtime)
+
+    def test_create_backend_uses_windows_metadata(self) -> None:
+        """Windows metadata should create the scheduled-task backend."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+
+        backend = self.controller.create_backend()
+
+        self.assertIsInstance(backend, service_manager.WindowsScheduledTaskBackend)
+
+    def test_create_backend_uses_linux_metadata(self) -> None:
+        """Linux metadata should create the systemd backend."""
+        controller = self.build_controller(platform_name="posix")
+        self.addCleanup(self.close_logger, controller.logger)
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
+        )
+
+        backend = controller.create_backend()
+
+        self.assertIsInstance(backend, service_manager.LinuxSystemdBackend)
+
+    def test_windows_status_not_installed(self) -> None:
+        """A missing scheduled task should report not installed."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "PyStreamASR", "uvicorn")
+        self.override_method(
+            self.controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout=json.dumps({"Installed": False, "State": "NotInstalled", "LastTaskResult": 0})
+            ),
+        )
+
         status = self.controller.get_service_status()
 
-        self.assertEqual(status.status, "stopped")
-        self.assertFalse(self.state_file.exists())
+        self.assertEqual(status.status, "not installed")
+        self.assertEqual(status.active_state.service_name, "PyStreamASR")
 
-    def test_status_running_when_pid_alive_and_health_ok(self) -> None:
-        """A live PID with a healthy endpoint should report running."""
-        self.controller.save_state(self.create_state())
-        self.override_method(self.controller, "is_pid_running", lambda pid: True)
-        self.override_method(self.controller, "is_managed_process", lambda state: True)
+    def test_windows_status_running_when_health_ok(self) -> None:
+        """A running scheduled task with healthy HTTP endpoint should report running."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "PyStreamASR", "uvicorn")
+        self.override_method(
+            self.controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout=json.dumps({"Installed": True, "State": "Running", "LastTaskResult": 0})
+            ),
+        )
         self.override_method(self.controller, "check_health", lambda host, port: True)
+
         status = self.controller.get_service_status()
 
         self.assertEqual(status.status, "running")
         self.assertTrue(status.health_ok)
         self.assertEqual(status.health_url, "http://127.0.0.1:8000/health")
 
-    def test_status_degraded_when_health_fails(self) -> None:
-        """A live PID with a failing endpoint should report degraded."""
-        self.controller.save_state(self.create_state())
-        self.override_method(self.controller, "is_pid_running", lambda pid: True)
-        self.override_method(self.controller, "is_managed_process", lambda state: True)
+    def test_windows_status_degraded_when_health_fails(self) -> None:
+        """A running scheduled task with an unhealthy endpoint should report degraded."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "PyStreamASR", "uvicorn")
+        self.override_method(
+            self.controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout=json.dumps({"Installed": True, "State": "Running", "LastTaskResult": 0})
+            ),
+        )
         self.override_method(self.controller, "check_health", lambda host, port: False)
+
         status = self.controller.get_service_status()
 
         self.assertEqual(status.status, "degraded")
         self.assertFalse(status.health_ok)
 
-    def test_is_pid_running_windows_uses_cim_lookup(self) -> None:
-        """Windows PID checks should use CIM output instead of locale-specific tasklist text."""
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str, returncode: int = 0) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = returncode
-
-        captured_args: list[str] = []
-
-        def fake_run(args: list[str], **kwargs: object) -> FakeCompletedProcess:
-            captured_args.extend(args)
-            return FakeCompletedProcess(
-                json.dumps(
-                    {
-                        "ProcessId": 4321,
-                        "CommandLine": "python -m uvicorn main:app --host 0.0.0.0 --port 8000",
-                        "CreationDate": "20260317000000.000000+000",
-                    }
-                )
-            )
-
-        self.override_method(service_manager.subprocess, "run", fake_run)
-
-        self.assertTrue(self.controller.is_pid_running(4321))
-        self.assertEqual(captured_args[:3], ["powershell", "-NoProfile", "-Command"])
-        self.assertIn("Get-CimInstance Win32_Process", captured_args[3])
-
-    def test_is_pid_running_windows_false_when_process_is_missing(self) -> None:
-        """A missing Windows PID should return False even if no localized status text is available."""
-
-        class FakeCompletedProcess:
-            def __init__(self, stdout: str, returncode: int = 0) -> None:
-                self.stdout = stdout
-                self.stderr = ""
-                self.returncode = returncode
-
-        def fake_run(args: list[str], **kwargs: object) -> FakeCompletedProcess:
-            return FakeCompletedProcess("")
-
-        self.override_method(service_manager.subprocess, "run", fake_run)
-
-        self.assertFalse(self.controller.is_pid_running(4321))
-
-    def test_duplicate_start_is_blocked(self) -> None:
-        """Starting an already-running managed service should not spawn again."""
-        running_status = service_manager.ServiceStatus(
-            status="running",
-            configured_runtime="uvicorn",
-            configured_host="0.0.0.0",
-            configured_port=8000,
-            configured_workers=1,
-            pid=4321,
-            pid_alive=True,
-            health_ok=True,
-            health_url="http://127.0.0.1:8000/health",
-            active_state=self.create_state(),
-            detail="Service is healthy.",
+    def test_windows_status_stopped_when_task_not_running(self) -> None:
+        """A non-running scheduled task should report stopped."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "PyStreamASR", "uvicorn")
+        self.override_method(
+            self.controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout=json.dumps({"Installed": True, "State": "Ready", "LastTaskResult": 0})
+            ),
         )
 
-        self.override_method(self.controller, "get_service_status", lambda: running_status)
+        status = self.controller.get_service_status()
 
-        def unexpected_popen(*args: object, **kwargs: object) -> None:
-            raise AssertionError("subprocess.Popen should not be called for duplicate start.")
+        self.assertEqual(status.status, "stopped")
+        self.assertFalse(status.pid_alive)
 
-        self.override_method(service_manager.subprocess, "Popen", unexpected_popen)
-        message = self.controller.start_service()
-        self.assertIn("already running", message)
-        self.assertIn("already running", self.log_file.read_text(encoding="utf-8"))
+    def test_linux_status_not_installed(self) -> None:
+        """A missing systemd unit should report not installed."""
+        controller = self.build_controller(platform_name="posix")
+        self.addCleanup(self.close_logger, controller.logger)
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
+        )
+        self.override_method(
+            controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout="LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+            ),
+        )
 
-    def test_start_service_does_not_capture_application_logs(self) -> None:
-        """Managed startup should not redirect child stdout/stderr into manager logs."""
+        status = controller.get_service_status()
+
+        self.assertEqual(status.status, "not installed")
+        self.assertEqual(status.active_state.backend, service_manager.LINUX_BACKEND)
+
+    def test_linux_status_running_when_health_ok(self) -> None:
+        """An active systemd unit with healthy HTTP endpoint should report running."""
+        controller = self.build_controller(platform_name="posix")
+        self.addCleanup(self.close_logger, controller.logger)
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
+        )
+        self.override_method(
+            controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout="LoadState=loaded\nActiveState=active\nSubState=running\nId=pystreamasr.service\n",
+            ),
+        )
+        self.override_method(controller, "check_health", lambda host, port: True)
+
+        status = controller.get_service_status()
+
+        self.assertEqual(status.status, "running")
+        self.assertTrue(status.health_ok)
+        self.assertEqual(status.health_url, "http://127.0.0.1:8000/health")
+
+    def test_linux_status_degraded_when_health_fails(self) -> None:
+        """An active systemd unit with an unhealthy endpoint should report degraded."""
+        controller = self.build_controller(platform_name="posix")
+        self.addCleanup(self.close_logger, controller.logger)
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
+        )
+        self.override_method(
+            controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout="LoadState=loaded\nActiveState=active\nSubState=running\nId=pystreamasr.service\n",
+            ),
+        )
+        self.override_method(controller, "check_health", lambda host, port: False)
+
+        status = controller.get_service_status()
+
+        self.assertEqual(status.status, "degraded")
+        self.assertFalse(status.health_ok)
+
+    def test_linux_status_stopped_when_unit_inactive(self) -> None:
+        """An inactive systemd unit should report stopped."""
+        controller = self.build_controller(platform_name="posix")
+        self.addCleanup(self.close_logger, controller.logger)
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
+        )
+        self.override_method(
+            controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout="LoadState=loaded\nActiveState=inactive\nSubState=dead\nId=pystreamasr.service\n",
+            ),
+        )
+
+        status = controller.get_service_status()
+
+        self.assertEqual(status.status, "stopped")
+        self.assertFalse(status.pid_alive)
+
+    def test_windows_start_dispatches_to_start_scheduled_task(self) -> None:
+        """Starting should invoke Start-ScheduledTask for the configured task."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
         self.override_method(
             self.controller,
             "get_service_status",
-            lambda: service_manager.ServiceStatus(
+            lambda: self.make_status(
                 status="stopped",
-                configured_runtime="uvicorn",
-                configured_host="0.0.0.0",
-                configured_port=8000,
-                configured_workers=1,
-                pid=None,
-                pid_alive=False,
-                health_ok=False,
-                health_url=None,
-                active_state=None,
-                detail="Service is not running.",
+                backend=service_manager.WINDOWS_BACKEND,
+                service_name="CustomTask",
+                runtime="uvicorn",
             ),
         )
-        self.override_method(
-            self.controller,
-            "get_process_info",
-            lambda pid: {"CreationDate": "20260317000000.000000+000"},
-        )
 
-        captured_kwargs: dict[str, object] = {}
+        captured_args: list[list[str]] = []
 
-        class FakeProcess:
-            pid = 2468
+        def fake_run_command(args: list[str]) -> FakeCompletedProcess:
+            captured_args.append(args)
+            return FakeCompletedProcess(stdout="ok\n")
 
-        def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
-            captured_kwargs.update(kwargs)
-            return FakeProcess()
-
-        self.override_method(service_manager.subprocess, "Popen", fake_popen)
+        self.override_method(self.controller, "run_command", fake_run_command)
 
         message = self.controller.start_service()
 
-        self.assertIn("PID 2468", message)
-        self.assertEqual(captured_kwargs["stdout"], service_manager.subprocess.DEVNULL)
-        self.assertEqual(captured_kwargs["stderr"], service_manager.subprocess.DEVNULL)
-        self.assertTrue(self.log_file.exists())
-        log_contents = self.log_file.read_text(encoding="utf-8")
-        self.assertIn("Starting managed uvicorn service", log_contents)
-        self.assertIn("Service start requested for PID 2468", log_contents)
+        self.assertIn("Start requested", message)
+        self.assertEqual(captured_args[0][:3], ["powershell.exe", "-NoProfile", "-Command"])
+        self.assertIn("Start-ScheduledTask", captured_args[0][3])
 
-    def test_restart_replaces_saved_state(self) -> None:
-        """Restart should replace old process metadata with the new state."""
-        self.controller.save_state(self.create_state(pid=1111))
-
-        def fake_stop() -> str:
-            self.controller.clear_state()
-            return "stopped"
-
-        def fake_start() -> str:
-            self.controller.save_state(self.create_state(pid=2222))
-            return "started"
-
-        self.override_method(self.controller, "stop_service", fake_stop)
-        self.override_method(self.controller, "start_service", fake_start)
-        message = self.controller.restart_service()
-
-        current_state = self.controller.load_state()
-        self.assertIsNotNone(current_state)
-        self.assertEqual(current_state.pid, 2222)
-        self.assertIn("stopped", message)
-        self.assertIn("started", message)
-
-    def test_build_command_uses_gunicorn_on_posix(self) -> None:
-        """macOS/Linux should launch gunicorn with explicit bind and workers."""
-        controller = service_manager.ServiceController(
-            root_dir=self.root_dir,
-            env_file=self.env_file,
-            state_file=self.state_file,
-            log_file=self.log_file,
-            python_executable=str(self.root_dir / "venv" / "bin" / "python"),
-            platform_name="posix",
+    def test_windows_stop_dispatches_to_stop_scheduled_task(self) -> None:
+        """Stopping should invoke Stop-ScheduledTask for the configured task."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+        self.override_method(
+            self.controller,
+            "get_service_status",
+            lambda: self.make_status(
+                status="running",
+                backend=service_manager.WINDOWS_BACKEND,
+                service_name="CustomTask",
+                runtime="uvicorn",
+            ),
         )
+
+        captured_args: list[list[str]] = []
+
+        def fake_run_command(args: list[str]) -> FakeCompletedProcess:
+            captured_args.append(args)
+            return FakeCompletedProcess(stdout="ok\n")
+
+        self.override_method(self.controller, "run_command", fake_run_command)
+
+        message = self.controller.stop_service()
+
+        self.assertIn("Stop requested", message)
+        self.assertEqual(captured_args[0][:3], ["powershell.exe", "-NoProfile", "-Command"])
+        self.assertIn("Stop-ScheduledTask", captured_args[0][3])
+
+    def test_linux_restart_dispatches_to_systemctl_restart(self) -> None:
+        """Restart should invoke `systemctl restart` for the configured unit."""
+        controller = self.build_controller(platform_name="posix")
         self.addCleanup(self.close_logger, controller.logger)
-
-        command = controller.build_command(controller.load_settings())
-
-        self.assertEqual(command[0], "gunicorn")
-        self.assertEqual(
-            command[1:],
-            [
-                "main:app",
-                "-c",
-                str(self.root_dir / "gunicorn.conf.py"),
-                "--bind",
-                "0.0.0.0:8000",
-                "--workers",
-                "1",
-            ],
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
         )
-
-    def test_is_managed_process_accepts_gunicorn_state(self) -> None:
-        """Saved gunicorn state should validate against the current process metadata."""
-        controller = service_manager.ServiceController(
-            root_dir=self.root_dir,
-            env_file=self.env_file,
-            state_file=self.state_file,
-            log_file=self.log_file,
-            python_executable="python",
-            platform_name="posix",
-        )
-        self.addCleanup(self.close_logger, controller.logger)
-
-        state = self.create_state(pid=9999, runtime="gunicorn")
-        state.launch_command = ["gunicorn", "main:app", "-c", str(self.root_dir / "gunicorn.conf.py")]
-        state.process_creation_date = "Thu Mar 18 01:23:45 2026"
-
         self.override_method(
             controller,
-            "get_process_info",
-            lambda pid: {
-                "CommandLine": "gunicorn main:app -c gunicorn.conf.py --bind 0.0.0.0:8000 --workers 1",
-                "CreationDate": "Thu Mar 18 01:23:45 2026",
-            },
+            "get_service_status",
+            lambda: self.make_status(
+                status="running",
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            ),
         )
 
-        self.assertTrue(controller.is_managed_process(state))
+        captured_args: list[list[str]] = []
 
-    def close_logger(self, logger: logging.Logger) -> None:
-        """Close handlers for an arbitrary logger instance."""
-        for handler in list(logger.handlers):
-            handler.close()
-            logger.removeHandler(handler)
+        def fake_run_command(args: list[str]) -> FakeCompletedProcess:
+            captured_args.append(args)
+            return FakeCompletedProcess(stdout="")
+
+        self.override_method(controller, "run_command", fake_run_command)
+
+        message = controller.restart_service()
+
+        self.assertIn("Restart requested", message)
+        self.assertEqual(captured_args[0], ["systemctl", "restart", "pystreamasr.service"])
 
 
 if __name__ == "__main__":

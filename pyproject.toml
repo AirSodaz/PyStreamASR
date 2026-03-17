@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pystreamasr"
+version = "0.1.0"
+description = "PyStreamASR service manager and streaming ASR service"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+[project.scripts]
+pystreamasr = "scripts.service_manager:main"
+
+[tool.setuptools.packages.find]
+include = ["api", "api.*", "core", "core.*", "services", "services.*", "scripts", "scripts.*"]

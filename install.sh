@@ -17,6 +17,7 @@ ENV_FILE="${ROOT_DIR}/.env"
 VENV_DIR="${ROOT_DIR}/venv"
 LOGS_DIR="${ROOT_DIR}/logs"
 UNIT_TEMPLATE_PATH="${ROOT_DIR}/scripts/${SERVICE_NAME}.service"
+INSTALL_METADATA_PATH="${LOGS_DIR}/service_install.json"
 
 log() {
   printf '[install] %s\n' "$1"
@@ -58,6 +59,7 @@ resolve_service_user() {
 validate_repo_files() {
   [[ -f "${UNIT_TEMPLATE_PATH}" ]] || fail "Missing unit template: ${UNIT_TEMPLATE_PATH}"
   [[ -f "${ROOT_DIR}/requirements.txt" ]] || fail "Missing requirements.txt in ${ROOT_DIR}"
+  [[ -f "${ROOT_DIR}/pyproject.toml" ]] || fail "Missing pyproject.toml in ${ROOT_DIR}"
   [[ -f "${ROOT_DIR}/gunicorn.conf.py" ]] || fail "Missing gunicorn.conf.py in ${ROOT_DIR}"
   [[ -f "${ROOT_DIR}/main.py" ]] || fail "Missing main.py in ${ROOT_DIR}"
 }
@@ -83,6 +85,19 @@ prepare_runtime_directories() {
   chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${LOGS_DIR}"
 }
 
+write_install_metadata() {
+  cat > "${INSTALL_METADATA_PATH}" <<EOF
+{
+  "backend": "systemd",
+  "service_name": "${SERVICE_NAME}.service",
+  "runtime": "gunicorn",
+  "install_mode": "service"
+}
+EOF
+
+  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_METADATA_PATH}"
+}
+
 prepare_virtualenv() {
   require_command python3.12
 
@@ -99,7 +114,18 @@ prepare_virtualenv() {
   log "Installing Python dependencies"
   "${VENV_DIR}/bin/pip" install -r "${ROOT_DIR}/requirements.txt"
 
+  log "Installing PyStreamASR console entry point"
+  "${VENV_DIR}/bin/python" -m pip install --no-deps -e "${ROOT_DIR}"
+
   chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${VENV_DIR}"
+}
+
+install_global_launcher() {
+  local entry_point="${VENV_DIR}/bin/pystreamasr"
+  [[ -x "${entry_point}" ]] || fail "pystreamasr console entry point not found at ${entry_point}"
+
+  log "Installing global pystreamasr launcher"
+  ln -sfn "${entry_point}" "/usr/local/bin/pystreamasr"
 }
 
 render_systemd_unit() {
@@ -152,12 +178,16 @@ main() {
   validate_env_file
   prepare_virtualenv
   prepare_runtime_directories
+  write_install_metadata
+  install_global_launcher
   render_systemd_unit
   enable_and_start_service
 
   cat <<EOF
 [install] Installed unit: ${SYSTEMD_UNIT_PATH}
 [install] Service name: ${SERVICE_NAME}.service
+[install] Console command: /usr/local/bin/pystreamasr
+[install] Install metadata: ${INSTALL_METADATA_PATH}
 [install] Status: systemctl status ${SERVICE_NAME} --no-pager
 [install] Logs: journalctl -u ${SERVICE_NAME} -n 100 --no-pager
 EOF

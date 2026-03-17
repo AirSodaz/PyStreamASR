@@ -1,19 +1,17 @@
-"""Terminal UI for managing the local PyStreamASR FastAPI service."""
+"""Terminal UI for managing the installed PyStreamASR service."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import signal
 import subprocess
 import sys
-import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from pathlib import Path
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -21,9 +19,14 @@ if str(ROOT_DIR) not in sys.path:
 from core.config import Settings, get_settings
 
 
+WINDOWS_BACKEND = "scheduled_task"
+LINUX_BACKEND = "systemd"
+DEFAULT_WINDOWS_TASK_NAME = "PyStreamASR"
+DEFAULT_LINUX_UNIT_NAME = "pystreamasr.service"
 DEFAULT_ENV_FILE = ROOT_DIR / ".env"
 DEFAULT_STATE_FILE = ROOT_DIR / "logs" / "service_state.json"
 DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "service_manager.log"
+DEFAULT_INSTALL_METADATA_FILE = ROOT_DIR / "logs" / "service_install.json"
 MENU_OPTIONS = (
     "1. View Status",
     "2. Start",
@@ -37,17 +40,35 @@ MENU_OPTIONS = (
 
 
 @dataclass(slots=True)
-class ServiceState:
-    """Persisted metadata for the managed service process."""
+class InstallMetadata:
+    """Installer-provided information about the managed service."""
 
-    pid: int
-    host: str
-    port: int
-    workers: int
-    started_at: str
-    launch_command: list[str]
-    runtime: str = "uvicorn"
-    process_creation_date: str | None = None
+    backend: str
+    service_name: str
+    runtime: str
+    install_mode: str = "service"
+
+
+@dataclass(slots=True)
+class BackendStatus:
+    """Current status returned by a service-manager backend."""
+
+    installed: bool
+    active: bool
+    manager_state: str
+    detail: str
+    pid: int | None = None
+
+
+@dataclass(slots=True)
+class ServiceState:
+    """Information about the configured managed service target."""
+
+    backend: str
+    service_name: str
+    runtime: str
+    manager_state: str
+    install_mode: str = "service"
     log_file: str | None = None
 
 
@@ -68,8 +89,267 @@ class ServiceStatus:
     detail: str
 
 
+class BaseServiceBackend:
+    """Common interface for platform-specific service managers."""
+
+    def __init__(self, controller: ServiceController, metadata: InstallMetadata) -> None:
+        """Store the controller and install metadata."""
+        self.controller = controller
+        self.metadata = metadata
+
+    def get_status(self) -> BackendStatus:
+        """Return the service manager's view of the service state."""
+        raise NotImplementedError
+
+    def start(self) -> str:
+        """Start the service."""
+        raise NotImplementedError
+
+    def stop(self) -> str:
+        """Stop the service."""
+        raise NotImplementedError
+
+    def restart(self) -> str:
+        """Restart the service."""
+        raise NotImplementedError
+
+    def _command_error(self, action: str, result: subprocess.CompletedProcess[str]) -> str:
+        """Normalize command failures into a single readable message."""
+        output = (result.stderr or result.stdout or "").strip()
+        if not output:
+            output = f"{action} failed with exit code {result.returncode}."
+        return output
+
+
+class WindowsScheduledTaskBackend(BaseServiceBackend):
+    """Manage the installed service through Windows Task Scheduler."""
+
+    def get_status(self) -> BackendStatus:
+        """Inspect the scheduled task state."""
+        safe_name = self.controller.quote_powershell_literal(self.metadata.service_name)
+        command = (
+            f"$task = Get-ScheduledTask -TaskName '{safe_name}' -ErrorAction SilentlyContinue; "
+            "if ($null -eq $task) { "
+            "[pscustomobject]@{ Installed = $false; State = 'NotInstalled'; LastTaskResult = 0 } "
+            "| ConvertTo-Json -Compress; exit 0 }; "
+            f"$info = Get-ScheduledTaskInfo -TaskName '{safe_name}'; "
+            "[pscustomobject]@{ "
+            "Installed = $true; "
+            "State = [string]$task.State; "
+            "LastTaskResult = [int]$info.LastTaskResult "
+            "} | ConvertTo-Json -Compress"
+        )
+
+        try:
+            result = self.controller.run_command(["powershell.exe", "-NoProfile", "-Command", command])
+        except OSError as exc:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="error",
+                detail=f"Failed to query scheduled task '{self.metadata.service_name}': {exc}",
+            )
+
+        if result.returncode != 0:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="error",
+                detail=(
+                    f"Failed to query scheduled task '{self.metadata.service_name}': "
+                    f"{self._command_error('status', result)}"
+                ),
+            )
+
+        payload = self.controller.parse_json_payload(result.stdout)
+        if payload is None:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="error",
+                detail=f"Scheduled task '{self.metadata.service_name}' returned unreadable status output.",
+            )
+
+        installed = bool(payload.get("Installed"))
+        raw_state = str(payload.get("State", "Unknown"))
+        normalized_state = raw_state.lower()
+        if not installed:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="not_installed",
+                detail=f"Scheduled task '{self.metadata.service_name}' is not installed.",
+            )
+
+        active = normalized_state in {"running", "queued"}
+        detail = f"Scheduled task '{self.metadata.service_name}' state: {raw_state}."
+        last_task_result = payload.get("LastTaskResult")
+        if not active and last_task_result not in {None, 0, "0"}:
+            detail = f"{detail} LastTaskResult={last_task_result}."
+
+        return BackendStatus(
+            installed=True,
+            active=active,
+            manager_state=normalized_state,
+            detail=detail,
+        )
+
+    def start(self) -> str:
+        """Start the scheduled task."""
+        return self._invoke("start", f"Start-ScheduledTask -TaskName '{self.controller.quote_powershell_literal(self.metadata.service_name)}' -ErrorAction Stop")
+
+    def stop(self) -> str:
+        """Stop the scheduled task."""
+        return self._invoke("stop", f"Stop-ScheduledTask -TaskName '{self.controller.quote_powershell_literal(self.metadata.service_name)}' -ErrorAction Stop")
+
+    def restart(self) -> str:
+        """Restart the scheduled task by stopping then starting it."""
+        status = self.get_status()
+        if not status.installed:
+            return status.detail
+
+        messages: list[str] = []
+        if status.active:
+            stop_message = self.stop()
+            if stop_message.startswith("Failed to"):
+                return stop_message
+            messages.append(stop_message)
+
+        start_message = self.start()
+        if start_message.startswith("Failed to"):
+            return start_message
+
+        messages.append(start_message)
+        return "\n".join(messages)
+
+    def _invoke(self, action: str, task_command: str) -> str:
+        """Run a task-scheduler action and return a user-facing message."""
+        command = f"try {{ {task_command}; Write-Output 'ok' }} catch {{ Write-Error $_; exit 1 }}"
+        try:
+            result = self.controller.run_command(["powershell.exe", "-NoProfile", "-Command", command])
+        except OSError as exc:
+            return f"Failed to {action} scheduled task '{self.metadata.service_name}': {exc}"
+
+        if result.returncode != 0:
+            return (
+                f"Failed to {action} scheduled task '{self.metadata.service_name}': "
+                f"{self._command_error(action, result)}"
+            )
+
+        self.controller.logger.info(
+            "%s requested for scheduled task '%s'.",
+            action.capitalize(),
+            self.metadata.service_name,
+        )
+        return f"{action.capitalize()} requested for scheduled task '{self.metadata.service_name}'."
+
+
+class LinuxSystemdBackend(BaseServiceBackend):
+    """Manage the installed service through systemd."""
+
+    def get_status(self) -> BackendStatus:
+        """Inspect the systemd unit state."""
+        command = [
+            "systemctl",
+            "show",
+            self.metadata.service_name,
+            "--no-pager",
+            "--property",
+            "LoadState",
+            "--property",
+            "ActiveState",
+            "--property",
+            "SubState",
+            "--property",
+            "UnitFileState",
+            "--property",
+            "Id",
+        ]
+
+        try:
+            result = self.controller.run_command(command)
+        except OSError as exc:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="error",
+                detail=f"Failed to query systemd unit '{self.metadata.service_name}': {exc}",
+            )
+
+        payload = self.controller.parse_key_value_payload(result.stdout)
+        load_state = payload.get("LoadState", "")
+        active_state = payload.get("ActiveState", "")
+        sub_state = payload.get("SubState", "")
+
+        if result.returncode != 0 and not payload:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="error",
+                detail=(
+                    f"Failed to query systemd unit '{self.metadata.service_name}': "
+                    f"{self._command_error('status', result)}"
+                ),
+            )
+
+        if load_state == "not-found" or not load_state:
+            return BackendStatus(
+                installed=False,
+                active=False,
+                manager_state="not_installed",
+                detail=f"systemd unit '{self.metadata.service_name}' is not installed.",
+            )
+
+        active = active_state in {"active", "activating", "reloading"}
+        detail = f"systemd unit '{self.metadata.service_name}' state: {active_state or 'unknown'}"
+        if sub_state:
+            detail = f"{detail}/{sub_state}."
+        else:
+            detail = f"{detail}."
+
+        return BackendStatus(
+            installed=True,
+            active=active,
+            manager_state=active_state or "unknown",
+            detail=detail,
+        )
+
+    def start(self) -> str:
+        """Start the systemd unit."""
+        return self._invoke("start")
+
+    def stop(self) -> str:
+        """Stop the systemd unit."""
+        return self._invoke("stop")
+
+    def restart(self) -> str:
+        """Restart the systemd unit."""
+        return self._invoke("restart")
+
+    def _invoke(self, action: str) -> str:
+        """Run a systemd action and return a user-facing message."""
+        command = ["systemctl", action, self.metadata.service_name]
+        try:
+            result = self.controller.run_command(command)
+        except OSError as exc:
+            return f"Failed to {action} systemd unit '{self.metadata.service_name}': {exc}"
+
+        if result.returncode != 0:
+            return (
+                f"Failed to {action} systemd unit '{self.metadata.service_name}': "
+                f"{self._command_error(action, result)}"
+            )
+
+        self.controller.logger.info(
+            "%s requested for systemd unit '%s'.",
+            action.capitalize(),
+            self.metadata.service_name,
+        )
+        return f"{action.capitalize()} requested for systemd unit '{self.metadata.service_name}'."
+
+
 class ServiceController:
-    """Manage the local service process and persisted runtime configuration."""
+    """Manage the installed service and runtime configuration."""
 
     def __init__(
         self,
@@ -79,16 +359,18 @@ class ServiceController:
         log_file: Path = DEFAULT_LOG_FILE,
         python_executable: str | None = None,
         platform_name: str | None = None,
+        install_metadata_file: Path = DEFAULT_INSTALL_METADATA_FILE,
     ) -> None:
         """Initialize the controller.
 
         Args:
-            root_dir: Project root used as the subprocess working directory.
+            root_dir: Project root used for relative paths and defaults.
             env_file: Environment file used for runtime settings persistence.
-            state_file: JSON file storing the managed process metadata.
+            state_file: Legacy state path kept for backward-compatible construction.
             log_file: Log file used for service-manager control events.
-            python_executable: Interpreter used to launch the managed server.
+            python_executable: Interpreter associated with the active install.
             platform_name: Optional platform override for testing.
+            install_metadata_file: Installer metadata file describing the service target.
         """
         self.root_dir = root_dir
         self.env_file = env_file
@@ -96,6 +378,7 @@ class ServiceController:
         self.log_file = log_file
         self.python_executable = python_executable or sys.executable
         self.platform_name = platform_name or os.name
+        self.install_metadata_file = install_metadata_file
         self.logger = self._build_logger()
 
     def _build_logger(self) -> logging.Logger:
@@ -120,13 +403,23 @@ class ServiceController:
     def get_service_status(self) -> ServiceStatus:
         """Inspect current runtime state and health information."""
         settings = self.load_settings()
-        state = self.load_state()
-        configured_runtime = self.get_runtime_name()
+        metadata = self.get_install_metadata()
+        backend = self.create_backend(metadata)
+        backend_status = backend.get_status()
 
-        if state is None:
+        state = ServiceState(
+            backend=metadata.backend,
+            service_name=metadata.service_name,
+            runtime=metadata.runtime,
+            manager_state=backend_status.manager_state,
+            install_mode=metadata.install_mode,
+            log_file=str(self.log_file),
+        )
+
+        if not backend_status.installed:
             return ServiceStatus(
-                status="stopped",
-                configured_runtime=configured_runtime,
+                status="not installed",
+                configured_runtime=metadata.runtime,
                 configured_host=settings.APP_HOST,
                 configured_port=settings.APP_PORT,
                 configured_workers=settings.APP_WORKERS,
@@ -134,54 +427,39 @@ class ServiceController:
                 pid_alive=False,
                 health_ok=False,
                 health_url=None,
-                active_state=None,
-                detail="Service is not running.",
+                active_state=state,
+                detail=backend_status.detail,
             )
 
-        if not self.is_pid_running(state.pid):
-            self.clear_state()
+        if not backend_status.active:
             return ServiceStatus(
                 status="stopped",
-                configured_runtime=configured_runtime,
+                configured_runtime=metadata.runtime,
                 configured_host=settings.APP_HOST,
                 configured_port=settings.APP_PORT,
                 configured_workers=settings.APP_WORKERS,
-                pid=None,
+                pid=backend_status.pid,
                 pid_alive=False,
                 health_ok=False,
                 health_url=None,
-                active_state=None,
-                detail="Saved service state was stale and has been cleared.",
+                active_state=state,
+                detail=backend_status.detail,
             )
 
-        if not self.is_managed_process(state):
-            self.clear_state()
-            return ServiceStatus(
-                status="stopped",
-                configured_runtime=configured_runtime,
-                configured_host=settings.APP_HOST,
-                configured_port=settings.APP_PORT,
-                configured_workers=settings.APP_WORKERS,
-                pid=None,
-                pid_alive=False,
-                health_ok=False,
-                health_url=None,
-                active_state=None,
-                detail=f"Saved PID no longer belongs to the managed {state.runtime} process.",
-            )
-
-        health_url = self.build_health_url(state.host, state.port)
-        health_ok = self.check_health(state.host, state.port)
+        health_url = self.build_health_url(settings.APP_HOST, settings.APP_PORT)
+        health_ok = self.check_health(settings.APP_HOST, settings.APP_PORT)
         status = "running" if health_ok else "degraded"
-        detail = "Service is healthy." if health_ok else "Process is running but /health did not respond successfully."
+        detail = backend_status.detail if health_ok else (
+            f"{backend_status.detail} Health endpoint {health_url} did not respond successfully."
+        )
 
         return ServiceStatus(
             status=status,
-            configured_runtime=configured_runtime,
+            configured_runtime=metadata.runtime,
             configured_host=settings.APP_HOST,
             configured_port=settings.APP_PORT,
             configured_workers=settings.APP_WORKERS,
-            pid=state.pid,
+            pid=backend_status.pid,
             pid_alive=True,
             health_ok=health_ok,
             health_url=health_url,
@@ -192,105 +470,36 @@ class ServiceController:
     def start_service(self) -> str:
         """Start the managed service if it is not already running."""
         status = self.get_service_status()
+        if status.status == "not installed":
+            self.logger.warning("Start requested but the managed service is not installed.")
+            return status.detail
         if status.pid_alive:
-            self.logger.info("Start skipped because service is already running with PID %s.", status.pid)
-            return f"Service is already running with PID {status.pid}."
+            self.logger.info("Start skipped because service is already active.")
+            return "Service is already running."
 
-        settings = self.load_settings()
-        runtime = self.get_runtime_name()
-        command = self.build_command(settings)
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        self.logger.info(
-            "Starting managed %s service with host=%s port=%s workers=%s.",
-            runtime,
-            settings.APP_HOST,
-            settings.APP_PORT,
-            settings.APP_WORKERS,
-        )
-
-        process = subprocess.Popen(
-            command,
-            cwd=self.root_dir,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=self.get_creation_flags(),
-        )
-
-        process_info = self.get_process_info(process.pid)
-        state = ServiceState(
-            pid=process.pid,
-            host=settings.APP_HOST,
-            port=settings.APP_PORT,
-            workers=settings.APP_WORKERS,
-            started_at=datetime.now(UTC).isoformat(),
-            launch_command=command,
-            runtime=runtime,
-            process_creation_date=process_info.get("CreationDate") if process_info else None,
-            log_file=str(self.log_file),
-        )
-        self.save_state(state)
-        self.logger.info("Service start requested for PID %s.", process.pid)
-        return (
-            f"Service start requested via {runtime}. PID {process.pid}, host {settings.APP_HOST}, "
-            f"port {settings.APP_PORT}, workers {settings.APP_WORKERS}."
-        )
+        return self.create_backend(self.get_install_metadata()).start()
 
     def stop_service(self) -> str:
         """Stop the managed service if it is running."""
-        state = self.load_state()
-        if state is None:
+        status = self.get_service_status()
+        if status.status == "not installed":
+            self.logger.warning("Stop requested but the managed service is not installed.")
+            return status.detail
+        if not status.pid_alive:
             self.logger.info("Stop skipped because service is already stopped.")
             return "Service is already stopped."
 
-        if not self.is_pid_running(state.pid):
-            self.clear_state()
-            self.logger.info("Cleared stale service state for PID %s during stop.", state.pid)
-            return "Service is already stopped. Cleared stale state."
-
-        if not self.is_managed_process(state):
-            self.clear_state()
-            self.logger.warning(
-                "Saved PID %s did not match the managed %s process.",
-                state.pid,
-                state.runtime,
-            )
-            return (
-                f"Saved PID did not match the managed {state.runtime} process. "
-                "Cleared state without stopping another process."
-            )
-
-        if self.send_graceful_stop(state.pid):
-            if self.wait_for_exit(state.pid, timeout_seconds=5.0):
-                self.clear_state()
-                self.logger.info("Service stopped gracefully for PID %s.", state.pid)
-                return f"Service stopped gracefully for PID {state.pid}."
-
-        self.stop_process(state.pid, force=False)
-        if self.wait_for_exit(state.pid, timeout_seconds=5.0):
-            self.clear_state()
-            self.logger.info("Service stopped for PID %s using a terminate signal.", state.pid)
-            return f"Service stopped for PID {state.pid}."
-
-        self.stop_process(state.pid, force=True)
-        if self.wait_for_exit(state.pid, timeout_seconds=5.0):
-            self.clear_state()
-            self.logger.warning("Service force-stopped for PID %s.", state.pid)
-            return f"Service force-stopped for PID {state.pid}."
-
-        self.logger.error("Failed to stop service PID %s.", state.pid)
-        return f"Failed to stop service PID {state.pid}. Check {self.log_file} for details."
+        return self.create_backend(self.get_install_metadata()).stop()
 
     def restart_service(self) -> str:
         """Restart the managed service using the latest persisted configuration."""
-        self.logger.info("Restart requested.")
-        stop_message = self.stop_service()
-        if self.get_service_status().pid_alive:
-            return stop_message
+        status = self.get_service_status()
+        if status.status == "not installed":
+            self.logger.warning("Restart requested but the managed service is not installed.")
+            return status.detail
 
-        start_message = self.start_service()
-        return f"{stop_message}\n{start_message}"
+        self.logger.info("Restart requested.")
+        return self.create_backend(self.get_install_metadata()).restart()
 
     def update_host(self, raw_value: str) -> str:
         """Validate and persist a new host value."""
@@ -313,83 +522,82 @@ class ServiceController:
         self.logger.info("Updated APP_WORKERS to %s.", normalized_workers)
         return f"Workers updated to {normalized_workers}."
 
-    def load_state(self) -> ServiceState | None:
-        """Load persisted process metadata from disk."""
-        if not self.state_file.exists():
-            return None
+    def get_install_metadata(self) -> InstallMetadata:
+        """Load installer metadata, or fall back to platform defaults."""
+        if self.install_metadata_file.exists():
+            try:
+                payload = json.loads(self.install_metadata_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                payload = None
 
-        try:
-            payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-            return ServiceState(**payload)
-        except (OSError, ValueError, TypeError):
-            return None
+            if isinstance(payload, dict):
+                backend = str(payload.get("backend", "")).strip()
+                service_name = str(payload.get("service_name", "")).strip()
+                runtime = str(payload.get("runtime", "")).strip()
+                install_mode = str(payload.get("install_mode", "service")).strip() or "service"
+                if backend and service_name and runtime:
+                    return InstallMetadata(
+                        backend=backend,
+                        service_name=service_name,
+                        runtime=runtime,
+                        install_mode=install_mode,
+                    )
 
-    def save_state(self, state: ServiceState) -> None:
-        """Persist process metadata to disk."""
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(
-            json.dumps(asdict(state), indent=2),
+        return self.default_install_metadata()
+
+    def save_install_metadata(self, metadata: InstallMetadata) -> None:
+        """Persist installer metadata for later TUI sessions."""
+        self.install_metadata_file.parent.mkdir(parents=True, exist_ok=True)
+        self.install_metadata_file.write_text(
+            json.dumps(asdict(metadata), indent=2) + "\n",
             encoding="utf-8",
         )
 
-    def clear_state(self) -> None:
-        """Remove persisted process metadata if it exists."""
-        if self.state_file.exists():
-            self.state_file.unlink()
-
-    def build_command(self, settings: Settings) -> list[str]:
-        """Build the server command line for the configured runtime."""
+    def default_install_metadata(self) -> InstallMetadata:
+        """Return the default installed service target for the current platform."""
         if self.is_windows_platform():
-            return [
-                self.python_executable,
-                "-m",
-                "uvicorn",
-                "main:app",
-                "--host",
-                settings.APP_HOST,
-                "--port",
-                str(settings.APP_PORT),
-                "--workers",
-                str(settings.APP_WORKERS),
-            ]
+            return InstallMetadata(
+                backend=WINDOWS_BACKEND,
+                service_name=DEFAULT_WINDOWS_TASK_NAME,
+                runtime="uvicorn",
+            )
 
-        return [
-            self.resolve_gunicorn_executable(),
-            "main:app",
-            "-c",
-            str(self.root_dir / "gunicorn.conf.py"),
-            "--bind",
-            f"{settings.APP_HOST}:{settings.APP_PORT}",
-            "--workers",
-            str(settings.APP_WORKERS),
-        ]
+        return InstallMetadata(
+            backend=LINUX_BACKEND,
+            service_name=DEFAULT_LINUX_UNIT_NAME,
+            runtime="gunicorn",
+        )
 
-    def get_creation_flags(self) -> int:
-        """Return subprocess flags for a dedicated process group when supported."""
-        if not self.is_windows_platform():
-            return 0
-        create_new_process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        return create_new_process_group
+    def create_backend(self, metadata: InstallMetadata | None = None) -> BaseServiceBackend:
+        """Build the service-manager backend for the active installation."""
+        metadata = metadata or self.get_install_metadata()
+        if metadata.backend == WINDOWS_BACKEND:
+            return WindowsScheduledTaskBackend(self, metadata)
+        if metadata.backend == LINUX_BACKEND:
+            return LinuxSystemdBackend(self, metadata)
+
+        raise ValueError(f"Unsupported service backend: {metadata.backend}")
 
     def get_runtime_name(self) -> str:
-        """Return the server runtime for the current platform."""
-        return "uvicorn" if self.is_windows_platform() else "gunicorn"
+        """Return the server runtime for the current installation."""
+        return self.get_install_metadata().runtime
 
     def get_runtime_display_name(self) -> str:
-        """Return a human-friendly runtime name for the current platform."""
+        """Return a human-friendly runtime name."""
         return self.get_runtime_name().capitalize()
+
+    def get_backend_display_name(self) -> str:
+        """Return a human-friendly backend name."""
+        metadata = self.get_install_metadata()
+        if metadata.backend == WINDOWS_BACKEND:
+            return "Scheduled Task"
+        if metadata.backend == LINUX_BACKEND:
+            return "systemd"
+        return metadata.backend
 
     def is_windows_platform(self) -> bool:
         """Return whether the controller is running on Windows."""
         return self.platform_name == "nt"
-
-    def resolve_gunicorn_executable(self) -> str:
-        """Resolve the gunicorn executable from the active virtual environment when available."""
-        python_path = Path(self.python_executable)
-        gunicorn_path = python_path.with_name("gunicorn")
-        if gunicorn_path.exists():
-            return str(gunicorn_path)
-        return "gunicorn"
 
     def persist_env_value(self, key: str, value: str) -> None:
         """Update or append a key in the environment file."""
@@ -414,159 +622,47 @@ class ServiceController:
 
         self.env_file.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
-    def is_pid_running(self, pid: int) -> bool:
-        """Check whether a PID currently exists."""
-        if self.is_windows_platform():
-            return self.get_windows_process_payload(pid) is not None
-
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
-    def get_process_info(self, pid: int) -> dict[str, str] | None:
-        """Return command-line metadata for the target PID."""
-        if self.is_windows_platform():
-            payload = self.get_windows_process_payload(pid)
-            if payload is None:
-                return None
-
-            command_line = payload.get("CommandLine")
-            creation_date = payload.get("CreationDate")
-            normalized_payload: dict[str, str] = {}
-            if isinstance(command_line, str):
-                normalized_payload["CommandLine"] = command_line
-            if isinstance(creation_date, str):
-                normalized_payload["CreationDate"] = creation_date
-            return normalized_payload or None
-
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="],
+    def run_command(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        """Execute a subprocess command and capture text output."""
+        return subprocess.run(
+            args,
             capture_output=True,
             text=True,
             check=False,
         )
-        output_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if result.returncode != 0 or not output_lines:
-            return None
 
-        parts = output_lines[0].split(None, 5)
-        if len(parts) < 6:
-            return None
+    @staticmethod
+    def quote_powershell_literal(value: str) -> str:
+        """Quote a PowerShell single-quoted literal."""
+        return value.replace("'", "''")
 
-        return {
-            "CreationDate": " ".join(parts[:5]),
-            "CommandLine": parts[5],
-        }
-
-    def is_managed_process(self, state: ServiceState) -> bool:
-        """Verify that the saved PID still points to the managed service process."""
-        process_info = self.get_process_info(state.pid)
-        if process_info is None:
-            return False
-
-        command_line = process_info.get("CommandLine", "")
-        creation_date = process_info.get("CreationDate")
-        if state.process_creation_date and creation_date != state.process_creation_date:
-            return False
-
-        runtime = state.runtime or self.get_runtime_name()
-        if runtime == "gunicorn":
-            return "gunicorn" in command_line and "main:app" in command_line
-        return "uvicorn" in command_line and "main:app" in command_line
-
-    def send_graceful_stop(self, pid: int) -> bool:
-        """Attempt a graceful stop using the platform's preferred signal."""
-        if not self.is_windows_platform():
-            try:
-                os.kill(pid, signal.SIGTERM)
-                return True
-            except OSError:
-                return False
-
-        ctrl_break_event = getattr(signal, "CTRL_BREAK_EVENT", None)
-        if ctrl_break_event is None:
-            return False
-        try:
-            os.kill(pid, ctrl_break_event)
-            return True
-        except OSError:
-            return False
-
-    def stop_process(self, pid: int, force: bool) -> None:
-        """Stop a managed process using platform-appropriate tooling."""
-        if self.is_windows_platform():
-            command = ["taskkill", "/PID", str(pid), "/T"]
-            if force:
-                command.insert(1, "/F")
-            try:
-                result = subprocess.run(command, capture_output=True, text=True, check=False)
-            except OSError as exc:
-                self.logger.warning("Failed to invoke taskkill for PID %s: %s", pid, exc)
-                return
-
-            if result.returncode != 0:
-                output = (result.stderr or result.stdout or "").strip()
-                if output:
-                    self.logger.warning(
-                        "taskkill returned %s for PID %s (force=%s): %s",
-                        result.returncode,
-                        pid,
-                        force,
-                        output,
-                    )
-            return
-
-        stop_signal = signal.SIGKILL if force else signal.SIGTERM
-        try:
-            os.kill(pid, stop_signal)
-        except OSError:
-            return
-
-    def get_windows_process_payload(self, pid: int) -> dict[str, object] | None:
-        """Return Windows process metadata for a PID using a locale-independent query."""
-        command = (
-            f"$process = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
-            "if ($null -eq $process) { return }; "
-            "$process | Select-Object ProcessId, CommandLine, CreationDate | ConvertTo-Json -Compress"
-        )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0 or not output:
+    @staticmethod
+    def parse_json_payload(output: str) -> dict[str, object] | None:
+        """Parse a JSON object payload."""
+        text = output.strip()
+        if not text:
             return None
 
         try:
-            payload = json.loads(output)
+            payload = json.loads(text)
         except json.JSONDecodeError:
             return None
 
         if not isinstance(payload, dict):
             return None
-
-        process_id = payload.get("ProcessId")
-        if str(process_id) != str(pid):
-            return None
-
         return payload
 
-    def wait_for_exit(self, pid: int, timeout_seconds: float) -> bool:
-        """Wait for a process to exit within the given timeout."""
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if not self.is_pid_running(pid):
-                return True
-            time.sleep(0.25)
-        return not self.is_pid_running(pid)
+    @staticmethod
+    def parse_key_value_payload(output: str) -> dict[str, str]:
+        """Parse `key=value` lines into a dictionary."""
+        payload: dict[str, str] = {}
+        for line in output.splitlines():
+            stripped_line = line.strip()
+            if not stripped_line or "=" not in stripped_line:
+                continue
+            key, value = stripped_line.split("=", 1)
+            payload[key] = value
+        return payload
 
     def build_health_url(self, host: str, port: int) -> str:
         """Build the health endpoint URL for a bound host/port pair."""
@@ -646,17 +742,25 @@ def format_status(status: ServiceStatus) -> list[str]:
     if status.active_state is not None:
         lines.extend(
             [
-                f"Managed PID: {status.active_state.pid}",
-                f"Active runtime: {status.active_state.runtime}",
-                f"Active host: {status.active_state.host}",
-                f"Active port: {status.active_state.port}",
-                f"Active workers: {status.active_state.workers}",
-                f"Health URL: {status.health_url}",
-                f"Health check: {'ok' if status.health_ok else 'failed'}",
+                f"Backend: {status.active_state.backend}",
+                f"Service name: {status.active_state.service_name}",
+                f"Install mode: {status.active_state.install_mode}",
+                f"Manager state: {status.active_state.manager_state}",
+                f"Runtime: {status.active_state.runtime}",
             ]
         )
+
+        if status.health_url is not None:
+            lines.extend(
+                [
+                    f"Health URL: {status.health_url}",
+                    f"Health check: {'ok' if status.health_ok else 'failed'}",
+                ]
+            )
+        else:
+            lines.append("Health URL: unavailable while service is stopped.")
     else:
-        lines.append("Managed PID: none")
+        lines.append("Managed service: unknown")
 
     lines.append(f"Detail: {status.detail}")
     return lines
@@ -664,11 +768,17 @@ def format_status(status: ServiceStatus) -> list[str]:
 
 def run_menu(controller: ServiceController) -> None:
     """Run the interactive terminal menu."""
-    message = f"Service manager ready for {controller.get_runtime_display_name()}."
+    message = (
+        f"Service manager ready for {controller.get_backend_display_name()} "
+        f"({controller.get_runtime_display_name()})."
+    )
 
     while True:
         clear_screen()
-        print(f"PyStreamASR Service Manager ({controller.get_runtime_display_name()})")
+        print(
+            "PyStreamASR Service Manager "
+            f"({controller.get_backend_display_name()} / {controller.get_runtime_display_name()})"
+        )
         print("=" * 28)
         print()
         for line in format_status(controller.get_service_status()):
