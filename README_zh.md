@@ -100,6 +100,26 @@ uvicorn main:app --reload
 
 使用相同的终端 UI，但会结合 `gunicorn.conf.py` 使用 Gunicorn 启动服务，同时仍然应用 `.env` 中的 `APP_HOST`、`APP_PORT` 和 `APP_WORKERS`。
 
+**Linux systemd 部署:**
+
+如果需要在 Linux 上通过 `systemd` 进行常驻部署，请运行：
+
+```bash
+sudo ./install.sh
+```
+
+该安装流程适用于具备 `systemd`、`python3.12`、已完成配置的 `.env`，以及已放置到 `models/` 目录或 `MODEL_PATH` 所指定位置的模型文件的 Linux 主机。安装脚本会校验 `.env`、创建或复用项目根目录下的 `venv`、安装依赖、生成 `/etc/systemd/system/pystreamasr.service`，并自动启用和启动服务。
+
+安装完成后的常用命令：
+
+```bash
+sudo systemctl status pystreamasr --no-pager
+sudo systemctl restart pystreamasr
+sudo systemctl stop pystreamasr
+sudo systemctl start pystreamasr
+sudo journalctl -u pystreamasr -n 100 --no-pager
+```
+
 **生产模式 (Uvicorn):**
 
 ```bash

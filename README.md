@@ -100,6 +100,26 @@ On macOS/Linux, use:
 
 The same TUI is used, but it starts the service with Gunicorn plus `gunicorn.conf.py`, while still applying `APP_HOST`, `APP_PORT`, and `APP_WORKERS` from `.env`.
 
+**Linux systemd deployment:**
+
+For a persistent Linux service managed by `systemd`, run:
+
+```bash
+sudo ./install.sh
+```
+
+This install path is intended for Linux hosts with `systemd`, `python3.12`, a populated `.env`, and downloaded model files already available under `models/` or at the configured `MODEL_PATH`. The installer validates `.env`, creates or reuses the repo-local `venv`, installs dependencies, renders `/etc/systemd/system/pystreamasr.service`, then enables and starts the service.
+
+Common operations after install:
+
+```bash
+sudo systemctl status pystreamasr --no-pager
+sudo systemctl restart pystreamasr
+sudo systemctl stop pystreamasr
+sudo systemctl start pystreamasr
+sudo journalctl -u pystreamasr -n 100 --no-pager
+```
+
 **Production mode (Uvicorn):**
 
 ```bash
