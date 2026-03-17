@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -151,6 +152,51 @@ class ServiceManagerTests(unittest.TestCase):
 
         self.assertEqual(status.status, "degraded")
         self.assertFalse(status.health_ok)
+
+    def test_is_pid_running_windows_uses_cim_lookup(self) -> None:
+        """Windows PID checks should use CIM output instead of locale-specific tasklist text."""
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str, returncode: int = 0) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = returncode
+
+        captured_args: list[str] = []
+
+        def fake_run(args: list[str], **kwargs: object) -> FakeCompletedProcess:
+            captured_args.extend(args)
+            return FakeCompletedProcess(
+                json.dumps(
+                    {
+                        "ProcessId": 4321,
+                        "CommandLine": "python -m uvicorn main:app --host 0.0.0.0 --port 8000",
+                        "CreationDate": "20260317000000.000000+000",
+                    }
+                )
+            )
+
+        self.override_method(service_manager.subprocess, "run", fake_run)
+
+        self.assertTrue(self.controller.is_pid_running(4321))
+        self.assertEqual(captured_args[:3], ["powershell", "-NoProfile", "-Command"])
+        self.assertIn("Get-CimInstance Win32_Process", captured_args[3])
+
+    def test_is_pid_running_windows_false_when_process_is_missing(self) -> None:
+        """A missing Windows PID should return False even if no localized status text is available."""
+
+        class FakeCompletedProcess:
+            def __init__(self, stdout: str, returncode: int = 0) -> None:
+                self.stdout = stdout
+                self.stderr = ""
+                self.returncode = returncode
+
+        def fake_run(args: list[str], **kwargs: object) -> FakeCompletedProcess:
+            return FakeCompletedProcess("")
+
+        self.override_method(service_manager.subprocess, "run", fake_run)
+
+        self.assertFalse(self.controller.is_pid_running(4321))
 
     def test_duplicate_start_is_blocked(self) -> None:
         """Starting an already-running managed service should not spawn again."""

@@ -417,14 +417,7 @@ class ServiceController:
     def is_pid_running(self, pid: int) -> bool:
         """Check whether a PID currently exists."""
         if self.is_windows_platform():
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            output = result.stdout.strip()
-            return bool(output) and "No tasks are running" not in output and "INFO:" not in output
+            return self.get_windows_process_payload(pid) is not None
 
         try:
             os.kill(pid, 0)
@@ -439,27 +432,8 @@ class ServiceController:
     def get_process_info(self, pid: int) -> dict[str, str] | None:
         """Return command-line metadata for the target PID."""
         if self.is_windows_platform():
-            command = (
-                f"$process = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
-                "if ($null -eq $process) { return }; "
-                "$process | Select-Object CommandLine, CreationDate | ConvertTo-Json -Compress"
-            )
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", command],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            output = result.stdout.strip()
-            if result.returncode != 0 or not output:
-                return None
-
-            try:
-                payload = json.loads(output)
-            except json.JSONDecodeError:
-                return None
-
-            if not isinstance(payload, dict):
+            payload = self.get_windows_process_payload(pid)
+            if payload is None:
                 return None
 
             command_line = payload.get("CommandLine")
@@ -530,7 +504,22 @@ class ServiceController:
             command = ["taskkill", "/PID", str(pid), "/T"]
             if force:
                 command.insert(1, "/F")
-            subprocess.run(command, capture_output=True, text=True, check=False)
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+            except OSError as exc:
+                self.logger.warning("Failed to invoke taskkill for PID %s: %s", pid, exc)
+                return
+
+            if result.returncode != 0:
+                output = (result.stderr or result.stdout or "").strip()
+                if output:
+                    self.logger.warning(
+                        "taskkill returned %s for PID %s (force=%s): %s",
+                        result.returncode,
+                        pid,
+                        force,
+                        output,
+                    )
             return
 
         stop_signal = signal.SIGKILL if force else signal.SIGTERM
@@ -538,6 +527,37 @@ class ServiceController:
             os.kill(pid, stop_signal)
         except OSError:
             return
+
+    def get_windows_process_payload(self, pid: int) -> dict[str, object] | None:
+        """Return Windows process metadata for a PID using a locale-independent query."""
+        command = (
+            f"$process = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+            "if ($null -eq $process) { return }; "
+            "$process | Select-Object ProcessId, CommandLine, CreationDate | ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0 or not output:
+            return None
+
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        process_id = payload.get("ProcessId")
+        if str(process_id) != str(pid):
+            return None
+
+        return payload
 
     def wait_for_exit(self, pid: int, timeout_seconds: float) -> bool:
         """Wait for a process to exit within the given timeout."""
