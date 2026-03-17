@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_DIR: str = "logs"
     RETURN_TRANSCRIPTION: bool = True
+    AUDIO_INPUT_FORMAT: str = "alaw"
+    AUDIO_SOURCE_RATE: int = 8000
 
     model_config = SettingsConfigDict(
         env_file=".env",

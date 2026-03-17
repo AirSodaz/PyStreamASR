@@ -26,42 +26,46 @@ except ImportError:
     print("Error: Please install required libraries via 'pip install -r requirements.txt'")
     sys.exit(1)
 
-# Try to import g711 (required for G.711 A-law encoding).
+# Try to import g711 (required for G.711 encoding).
 try:
     import g711
 except ImportError:
     print("Error: 'g711' library not found. Install it via 'pip install g711'.")
     sys.exit(1)
 
-def convert_to_alaw(pcm_data_int16):
+def encode_g711(pcm_data_int16, audio_format):
     """
-    Convert 16-bit PCM (numpy int16 array) to G.711 A-law bytes.
+    Convert 16-bit PCM (numpy int16 array) to G.711 bytes.
     """
-    # If g711 library is installed and has encode_alaw
-    if g711 and hasattr(g711, "encode_alaw"):
-        # Some g711 libs take raw bytes, some take samples.
-        # We'll assume it might take bytes of PCM.
-        # Check standard usage: often g711.encode_alaw(samples)
-        try:
-            return g711.encode_alaw(pcm_data_int16.tobytes())
-        except:
-             # If it expects an iterable of ints
-             return g711.encode_alaw(pcm_data_int16.tolist())
-    
-    raise RuntimeError("G.711 encoder not available. Install the 'g711' package.")
+    if audio_format == "ulaw":
+        encoder_name = "encode_ulaw"
+    else:
+        encoder_name = "encode_alaw"
+
+    encoder = getattr(g711, encoder_name, None)
+    if encoder is None:
+        raise RuntimeError(f"g711.{encoder_name} is not available. Install or update the 'g711' package.")
+
+    # Some g711 libs take raw bytes, some take samples.
+    # We'll assume it might take bytes of PCM.
+    try:
+        return encoder(pcm_data_int16.tobytes())
+    except Exception:
+        # If it expects an iterable of ints
+        return encoder(pcm_data_int16.tolist())
 
 def parse_wav_header(file_path):
     """
-    Parses WAV header to determine if it's G.711 A-law (Format=6) or PCM (Format=1).
-    Returns (is_alaw, data_start_offset, data_length)
-    is_alaw is True if Format=6 (A-law), Channels=1, SampleRate=8000, Bits=8.
+    Parses WAV header to determine if it's G.711 A-law (Format=6), μ-law (Format=7), or PCM (Format=1).
+    Returns (format_str, sample_rate, data_start_offset, data_length)
+    format_str: "alaw", "ulaw", "pcm16le", or "" if unknown.
     """
     try:
         with open(file_path, 'rb') as f:
             # RIFF header
             chunk_id, size, format_tag = struct.unpack('<4sI4s', f.read(12))
             if chunk_id != b'RIFF' or format_tag != b'WAVE':
-                return False, 0, 0
+                return "", 0, 0, 0
             
             # Find chunks
             while True:
@@ -75,17 +79,14 @@ def parse_wav_header(file_path):
                     fmt_data = f.read(subchunk_size)
                     audio_format, num_channels, sample_rate, byte_rate, block_align, bits_per_sample = struct.unpack('<HHIIHH', fmt_data[:16])
                     
-                    # Check for G.711 A-law: Format 6, 1 channel, 8000Hz, 8 bits
-                    if audio_format == 6 and num_channels == 1 and sample_rate == 8000 and bits_per_sample == 8:
-                        # Found A-law, but need to find data chunk next
-                        pass
-                    elif audio_format == 7: # Mu-law
-                         pass
-                    elif audio_format == 1: # PCM
-                         pass
-                    
-                    # Store params for return if needed, but we just want boolean "is_alaw_ready"
-                    is_alaw_ready = (audio_format == 6 and num_channels == 1 and sample_rate == 8000 and bits_per_sample == 8)
+                    if audio_format == 6 and num_channels == 1 and bits_per_sample == 8:
+                        fmt = "alaw"
+                    elif audio_format == 7 and num_channels == 1 and bits_per_sample == 8:
+                        fmt = "ulaw"
+                    elif audio_format == 1 and num_channels == 1 and bits_per_sample == 16:
+                        fmt = "pcm16le"
+                    else:
+                        fmt = ""
                     
                     if subchunk_size > 16:
                         # Skip extra bytes if any (though we read subchunk_size above? No we read subchunk_size bytes? 
@@ -95,7 +96,7 @@ def parse_wav_header(file_path):
                 elif subchunk_id == b'data':
                     # Found data
                     data_start = f.tell()
-                    return (locals().get('is_alaw_ready', False), data_start, subchunk_size)
+                    return (locals().get('fmt', ""), locals().get('sample_rate', 0), data_start, subchunk_size)
                 else:
                     # Skip other chunks
                     f.seek(subchunk_size, 1)
@@ -103,19 +104,37 @@ def parse_wav_header(file_path):
     except Exception as e:
         print(f"Header parse error: {e}")
     
-    return False, 0, 0
+    return "", 0, 0, 0
 
-async def get_audio_generator(audio_file, chunk_duration):
+async def get_audio_generator(audio_file, chunk_duration, audio_format, sample_rate):
     """
-    Yields chunks of G.711 A-law bytes.
+    Yields chunks of audio bytes.
     Handles raw files, G.711 WAVs, and standard PCM WAVs (via conversion).
     """
-    chunk_size = int(8000 * chunk_duration)
+    bytes_per_sample = 1 if audio_format in ("alaw", "ulaw") else 2
+    samples_per_chunk = int(sample_rate * chunk_duration)
+    chunk_size = samples_per_chunk * bytes_per_sample
     
     # 1. Check extension for raw
     ext = os.path.splitext(audio_file)[1].lower()
-    if ext in ['.alaw', '.pcma', '.g711']:
-        print(f"Detected raw G.711 file: {audio_file}")
+    if ext in ['.alaw', '.pcma', '.g711', '.ulaw', '.pcmu', '.mulaw']:
+        detected_format = "alaw" if ext in ['.alaw', '.pcma', '.g711'] else "ulaw"
+        if audio_format != detected_format:
+            print(f"Error: Raw G.711 file is {detected_format}, but --format is {audio_format}.")
+            return
+        print(f"Detected raw G.711 {detected_format}: {audio_file}")
+        with open(audio_file, 'rb') as f:
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                yield data
+        return
+    if ext in ['.pcm', '.raw']:
+        if audio_format != "pcm16le":
+            print("Error: Raw PCM file requires --format pcm16le.")
+            return
+        print(f"Detected raw PCM16LE file: {audio_file}")
         with open(audio_file, 'rb') as f:
             while True:
                 data = f.read(chunk_size)
@@ -125,9 +144,14 @@ async def get_audio_generator(audio_file, chunk_duration):
         return
 
     # 2. Check WAV header
-    is_alaw, data_offset, data_len = parse_wav_header(audio_file)
-    if is_alaw:
-        print(f"Detected G.711 A-law WAV: {audio_file} (passing through)")
+    wav_format, wav_sr, data_offset, data_len = parse_wav_header(audio_file)
+    if wav_format in ("alaw", "ulaw"):
+        if audio_format != wav_format:
+            print(f"Error: WAV is {wav_format}, but --format is {audio_format}.")
+            return
+        if wav_sr != sample_rate:
+            print(f"Warning: WAV sample rate is {wav_sr}, but --sample_rate is {sample_rate}.")
+        print(f"Detected G.711 {wav_format} WAV: {audio_file} (passing through)")
         with open(audio_file, 'rb') as f:
             f.seek(data_offset)
             read_bytes = 0
@@ -142,36 +166,48 @@ async def get_audio_generator(audio_file, chunk_duration):
                 yield data
                 read_bytes += len(data)
         return
+    if wav_format == "pcm16le" and audio_format == "pcm16le":
+        if wav_sr != sample_rate:
+            print(f"Warning: WAV sample rate is {wav_sr}, but --sample_rate is {sample_rate}.")
 
-    # 3. Fallback to Librosa/Conversion (Standard PCM)
-    print(f"Processing as PCM WAV/Audio: {audio_file}...")
+    # 3. Fallback to Librosa/Conversion (Standard PCM/Audio)
+    print(f"Processing as PCM audio: {audio_file}...")
     try:
         # Load and Resample
-        y, sr = librosa.load(audio_file, sr=8000)
+        y, sr = librosa.load(audio_file, sr=sample_rate)
     except Exception as e:
         print(f"Failed to load audio: {e}")
         return
 
     # Convert to Int16
     pcm_data = (y * 32767).astype(np.int16)
-    
-    # Encode
-    raw_bytes = convert_to_alaw(pcm_data)
-    
-    total_len = len(raw_bytes)
-    offset = 0
-    while offset < total_len:
-        end = min(offset + chunk_size, total_len)
-        yield raw_bytes[offset:end]
-        offset = end
 
-async def send_audio(websocket, audio_file, chunk_duration):
+    if audio_format in ("alaw", "ulaw"):
+        # Encode
+        raw_bytes = encode_g711(pcm_data, audio_format)
+        total_len = len(raw_bytes)
+        offset = 0
+        while offset < total_len:
+            end = min(offset + chunk_size, total_len)
+            yield raw_bytes[offset:end]
+            offset = end
+    else:
+        # PCM16LE bytes
+        raw_bytes = pcm_data.tobytes()
+        total_len = len(raw_bytes)
+        offset = 0
+        while offset < total_len:
+            end = min(offset + chunk_size, total_len)
+            yield raw_bytes[offset:end]
+            offset = end
+
+async def send_audio(websocket, audio_file, chunk_duration, audio_format, sample_rate):
     """
     Streams audio chunks to WebSocket.
     """
     print(f"Preparing stream for {audio_file}...")
     
-    chunk_generator = get_audio_generator(audio_file, chunk_duration)
+    chunk_generator = get_audio_generator(audio_file, chunk_duration, audio_format, sample_rate)
     
     start_time = time.time()
     chunk_count = 0
@@ -214,9 +250,16 @@ async def main():
     parser.add_argument("--file", default="test_audio.wav", help="Path to input audio file")
     parser.add_argument("--host", default="ws://localhost:8000/ws/transcribe/test-session-1", help="WebSocket URL")
     parser.add_argument("--chunk_duration", type=float, default=0.6, help="Chunk duration in seconds")
+    parser.add_argument("--format", default="alaw", choices=["alaw", "ulaw", "pcm16le"], help="Audio format")
+    parser.add_argument("--sample_rate", type=int, default=8000, choices=[8000, 16000], help="Sample rate")
     
     args = parser.parse_args()
     
+    if args.format == "pcm16le" and args.sample_rate == 8000:
+        print("Warning: pcm16le at 8000 Hz will be resampled on the server.")
+    if args.format in ("alaw", "ulaw") and args.sample_rate != 8000:
+        print("Warning: G.711 is typically 8000 Hz; ensure server config matches.")
+
     print(f"Connecting to {args.host}...")
     
     try:
@@ -225,7 +268,7 @@ async def main():
             
             # Run send and receive in parallel
             tasks = [
-                asyncio.create_task(send_audio(websocket, args.file, args.chunk_duration)),
+                asyncio.create_task(send_audio(websocket, args.file, args.chunk_duration, args.format, args.sample_rate)),
                 asyncio.create_task(receive_results(websocket))
             ]
 

@@ -2,6 +2,7 @@ import g711
 import numpy as np
 import logging
 import time
+from core.config import settings
 
 
 class AudioProcessor:
@@ -9,27 +10,42 @@ class AudioProcessor:
         # Target sample rate
         self.target_rate = 16000
         
-        # --- CONFIGURATION (Manual Switch) ---
-        # Format: "g711" (default) or "pcm16"
-        self.input_format = "g711" 
-        # Source Sample Rate: 8000 for G.711, 16000 for typical PCM, etc.
-        self.source_rate = 8000  
-        # -------------------------------------
+        # Configuration from settings
+        self.input_format = settings.AUDIO_INPUT_FORMAT.strip().lower()
+        self.source_rate = int(settings.AUDIO_SOURCE_RATE)
 
-    def decode_g711(self, data: bytes) -> np.ndarray:
-        """Decodes G.711 A-law bytes to PCM (int16 or float32).
+        supported_formats = {"alaw", "ulaw", "pcm16le"}
+        if self.input_format not in supported_formats:
+            raise ValueError(
+                f"Unsupported AUDIO_INPUT_FORMAT: {self.input_format}. "
+                f"Supported: {', '.join(sorted(supported_formats))}"
+            )
+
+        if self.source_rate not in (8000, 16000):
+            raise ValueError(
+                f"Unsupported AUDIO_SOURCE_RATE: {self.source_rate}. "
+                "Supported: 8000 or 16000"
+            )
+
+    def _decode_g711(self, data: bytes, decoder_name: str) -> np.ndarray:
+        """Decodes G.711 bytes to PCM (int16 or float32).
 
         Args:
-            data (bytes): The input G.711 A-law encoded audio bytes.
+            data (bytes): The input G.711 encoded audio bytes.
+            decoder_name (str): g711 decoder function name.
 
         Returns:
             np.ndarray: A numpy array of int16 PCM data or float32 data.
         """
         start_time = time.perf_counter()
 
-        # g711.decode_alaw returns bytes representing int16 PCM (in older versions)
+        decoder = getattr(g711, decoder_name, None)
+        if decoder is None:
+            raise RuntimeError(f"g711.{decoder_name} is not available. Please update the g711 package.")
+
+        # g711.decode_* returns bytes representing int16 PCM (in older versions)
         # or a numpy array of float32 (in newer versions like 1.6.5)
-        decoded = g711.decode_alaw(data)
+        decoded = decoder(data)
 
         if isinstance(decoded, np.ndarray):
             result = decoded
@@ -38,7 +54,10 @@ class AudioProcessor:
             result = np.frombuffer(decoded, dtype=np.int16)
 
         duration = time.perf_counter() - start_time
-        logging.debug(f"[Audio] decode_g711 took {duration:.6f}s. Output shape: {result.shape}, dtype: {result.dtype}")
+        logging.debug(
+            f"[Audio] decode_{decoder_name} took {duration:.6f}s. "
+            f"Output shape: {result.shape}, dtype: {result.dtype}"
+        )
         return result
 
     def resample(self, pcm_data: np.ndarray) -> np.ndarray:
@@ -84,12 +103,15 @@ class AudioProcessor:
         logging.debug(f"[Audio] Processing chunk of size {input_len} bytes, fmt={self.input_format}")
 
         # 1. Decode / Load
-        if self.input_format == "pcm16":
+        if self.input_format == "pcm16le":
             # Input is raw Int16 PCM bytes
             pcm_data = np.frombuffer(chunk, dtype=np.int16)
+        elif self.input_format == "ulaw":
+            # G.711 mu-law
+            pcm_data = self._decode_g711(chunk, "decode_ulaw")
         else:
             # Default to G.711 A-law
-            pcm_data = self.decode_g711(chunk)
+            pcm_data = self._decode_g711(chunk, "decode_alaw")
 
         # 2. Normalize to [-1, 1]
         # Whether from G.711 decode (if int16) or direct PCM16 load, we normalise here.

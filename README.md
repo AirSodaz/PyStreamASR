@@ -6,7 +6,7 @@ PyStreamASR is a real-time Automatic Speech Recognition (ASR) streaming service 
 
 *   **Real-time Streaming**: Efficient WebSocket-based audio streaming (Pseudo-streaming supported).
 *   **High Performance ASR**: Powered by **Sherpa-onnx** (Streaming Paraformer) for robust bilingual (Chinese/English) transcription.
-*   **Audio Processing**: Native support for G.711 A-law encoding (8000Hz) with optimized decoding and resampling to 16000Hz PCM.
+*   **Audio Processing**: Native support for G.711 A-law/μ-law and PCM16LE (8k/16k) with optimized decoding and resampling to 16000Hz PCM.
 *   **Non-blocking Architecture**: Built on FastAPI with asynchronous I/O for network and DB operations, using `loop.run_in_executor` for CPU-bound inference.
 *   **Data Persistence**:
     *   **In-memory Hash Table**: For managing ephemeral session state and real-time partial results (hot data).
@@ -48,7 +48,23 @@ MYSQL_DATABASE_URL="mysql+aiomysql://user:password@localhost/dbname"
 MODEL_PATH="models/sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 LOG_LEVEL="INFO"
 LOG_DIR="logs"
+RETURN_TRANSCRIPTION=true
+AUDIO_INPUT_FORMAT="alaw"  # alaw | ulaw | pcm16le
+AUDIO_SOURCE_RATE=8000     # 8000 | 16000
 ```
+
+### .env Variables (Required/Optional + Options)
+
+| Variable | Required | Default | Options / Notes |
+| --- | --- | --- | --- |
+| `MYSQL_DATABASE_URL` | Yes | None | SQLAlchemy DSN. Example: `mysql+aiomysql://user:password@host/dbname`. |
+| `MODEL_PATH` | Yes | None | Model directory path. Can be absolute or project-relative. |
+| `PROJECT_NAME` | No | `PyStreamASR` | Any string. Used in app title and `/health`. |
+| `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `LOG_DIR` | No | `logs` | Directory for log files. |
+| `RETURN_TRANSCRIPTION` | No | `true` | `true` or `false`. When `false`, server will still process but will not return transcription messages on WebSocket. |
+| `AUDIO_INPUT_FORMAT` | No | `alaw` | `alaw`, `ulaw`, `pcm16le`. Must match the stream format sent by clients. |
+| `AUDIO_SOURCE_RATE` | No | `8000` | `8000` or `16000`. Must match the stream sample rate sent by clients. |
 
 ## Usage
 
@@ -99,9 +115,16 @@ python scripts/simulate_stream.py --file path/to/audio.wav --host ws://127.0.0.1
 ```
 
 **Arguments:**
-*   `--file`: Path to the input audio file (WAV, G.711 A-law, etc.).
+*   `--file`: Input audio file path. Supported:
+    *   Raw G.711: `.alaw`, `.pcma`, `.g711`, `.ulaw`, `.pcmu`, `.mulaw` (must match `--format`).
+    *   Raw PCM16LE: `.pcm`, `.raw` (requires `--format pcm16le`).
+    *   WAV:
+        *   G.711 A-law/μ-law WAV is passed through (format must match `--format`).
+        *   PCM WAV/other audio is loaded and converted to the stream format using `librosa`.
 *   `--host`: WebSocket URL (default: `ws://localhost:8000/ws/transcribe/test-session-1`).
-*   `--chunk_duration`: Duration of audio chunks in seconds (default: `0.6`).
+*   `--chunk_duration`: Duration per chunk in seconds (default: `0.6`). Controls chunk size and sleep interval to simulate real-time streaming.
+*   `--format`: Stream encoding format: `alaw`, `ulaw`, or `pcm16le` (default: `alaw`).
+*   `--sample_rate`: Stream sample rate: `8000` or `16000` (default: `8000`). G.711 is typically `8000`.
 
 ## Project Structure
 
