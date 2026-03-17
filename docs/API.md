@@ -1,3 +1,5 @@
+**English** | [中文](API_zh.md)
+
 # PyStreamASR API Documentation
 
 ## Real-Time Speech Transcription
