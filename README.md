@@ -51,6 +51,9 @@ LOG_DIR="logs"
 RETURN_TRANSCRIPTION=true
 AUDIO_INPUT_FORMAT="alaw"  # alaw | ulaw | pcm16le
 AUDIO_SOURCE_RATE=8000     # 8000 | 16000
+APP_HOST="0.0.0.0"
+APP_PORT=8000
+APP_WORKERS=1
 ```
 
 ### .env Variables (Required/Optional + Options)
@@ -65,6 +68,9 @@ AUDIO_SOURCE_RATE=8000     # 8000 | 16000
 | `RETURN_TRANSCRIPTION` | No | `true` | `true` or `false`. When `false`, server will still process but will not return transcription messages on WebSocket. |
 | `AUDIO_INPUT_FORMAT` | No | `alaw` | `alaw`, `ulaw`, `pcm16le`. Must match the stream format sent by clients. |
 | `AUDIO_SOURCE_RATE` | No | `8000` | `8000` or `16000`. Must match the stream sample rate sent by clients. |
+| `APP_HOST` | No | `0.0.0.0` | Bind host used by the terminal service manager. |
+| `APP_PORT` | No | `8000` | Bind port used by the terminal service manager. |
+| `APP_WORKERS` | No | `1` | Uvicorn worker count used by the terminal service manager. |
 
 ## Usage
 
@@ -75,6 +81,14 @@ AUDIO_SOURCE_RATE=8000     # 8000 | 16000
 ```bash
 uvicorn main:app --reload
 ```
+
+**Windows terminal service manager:**
+
+```powershell
+.\scripts\manage_service.bat
+```
+
+This opens a numbered terminal menu for viewing status, starting, stopping, restarting, and updating `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`.
 
 **Production mode (Uvicorn):**
 
