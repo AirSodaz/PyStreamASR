@@ -13,10 +13,10 @@ This file contains critical context, constraints, and operational commands for t
 
 ## 2. Core Architecture Constraints
 * **Concurrency Model:**
-    * **I/O (Network, DB):** Must be `async/await` (FastAPI, aiomysql, redis-py).
+    * **I/O (Network, DB):** Must be `async/await` (FastAPI, aiomysql).
     * **CPU (Inference):** Must run in `loop.run_in_executor`. **NEVER** block the main event loop with model inference or heavy audio processing.
 * **Storage Strategy:**
-    * **Hot Data (Partial):** Redis. Key: `asr:sess:{id}:current`.
+    * **Hot Data (Partial):** In-memory hash table. Key: `asr:sess:{id}:current`.
     * **Cold Data (Final):** MySQL. Table: `segments`.
 * **Audio Pipeline:**
     * Input: WebSocket -> G.711 (8k) -> PCM (16k) -> Sherpa-onnx (Paraformer-Streaming).
@@ -38,7 +38,7 @@ PyStreamASR/
 │   ├── audio.py              # AudioProcessor class (G.711 decoding, Resampling).
 │   ├── inference.py          # ASRInferenceService class (Model loading, ThreadPool execution).
 │   ├── schemas.py            # SQLAlchemy Async Models (Tables: 'sessions', 'segments').
-│   └── storage.py            # StorageManager class (Redis buffering, MySQL persistence).
+│   └── storage.py            # StorageManager class (In-memory buffering, MySQL persistence).
 ├── scripts/
 │   ├── tests/                # (Placeholder for pytest)
 │   └── simulate_stream.py    # Client simulation script for QA/Testing.

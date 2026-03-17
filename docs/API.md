@@ -177,6 +177,6 @@ The server closes the WebSocket gracefully when the client disconnects. No error
 ### Notes
 
 - **Audio Format:** Input must be G.711 encoded at 8kHz. The server resamples to 16kHz internally for the ASR model.
-- **Session Persistence:** Final transcriptions are stored in MySQL; partial results are cached in Redis.
+- **Session Persistence:** Final transcriptions are stored in MySQL; partial results are cached in memory.
 - **Reconnection:** Using the same `session_id` resumes from the last sequence number.
 - **Concurrency:** Audio processing and inference run in a thread pool to avoid blocking the event loop.

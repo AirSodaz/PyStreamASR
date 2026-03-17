@@ -1,10 +1,11 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 import asyncio
-import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 import logging
 import time
+from typing import Dict
 from sqlalchemy import select, text
 from core.config import settings
 from services.schemas import Segment, Session
@@ -13,22 +14,47 @@ from services.schemas import Segment, Session
 engine = create_async_engine(settings.MYSQL_DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-# Redis Setup
-redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+@dataclass
+class PartialEntry:
+    """In-memory partial transcription entry."""
+    content: str
+    seq: int
+    ts_iso: str
+    expires_at: float
+
+
+_PARTIAL_TTL_SECONDS = 300.0
+_SEQ_BY_SESSION: Dict[str, int] = {}
+_PARTIAL_BY_SESSION: Dict[str, PartialEntry] = {}
+_CACHE_LOCK: asyncio.Lock | None = None
+
+
+def _get_cache_lock() -> asyncio.Lock:
+    global _CACHE_LOCK
+    if _CACHE_LOCK is None:
+        _CACHE_LOCK = asyncio.Lock()
+    return _CACHE_LOCK
+
+
+def _cleanup_expired_partials(now: float) -> None:
+    expired_sessions = [
+        session_id
+        for session_id, entry in _PARTIAL_BY_SESSION.items()
+        if entry.expires_at <= now
+    ]
+    for session_id in expired_sessions:
+        _PARTIAL_BY_SESSION.pop(session_id, None)
 
 
 async def check_database_connections():
-    """Checks connections to MySQL and Redis."""
+    """Checks connection to MySQL and validates in-memory cache state."""
     try:
         logging.info("Checking database connections...")
         # Check MySQL
         async with AsyncSessionLocal() as session:
             await session.execute(text("SELECT 1"))
         logging.info("MySQL connection successful.")
-
-        # Check Redis
-        await redis_client.ping()
-        logging.info("Redis connection successful.")
+        logging.info("In-memory cache available.")
 
     except Exception as e:
         logging.error(f"Database connection failed: {e}")
@@ -67,20 +93,35 @@ class StorageManager:
 
 
     async def get_next_sequence(self) -> int:
-        """Atomically increments the sequence counter for this session in Redis.
+        """Atomically increments the sequence counter for this session in memory.
 
         Returns:
             int: The new sequence number.
         """
         start_time = time.perf_counter()
-        key = f"asr:sess:{self.session_id}:seq"
-        res = await redis_client.incr(key)
+        async with _get_cache_lock():
+            current = _SEQ_BY_SESSION.get(self.session_id, 0) + 1
+            _SEQ_BY_SESSION[self.session_id] = current
+            res = current
         duration = time.perf_counter() - start_time
-        logging.debug(f"[Storage] Redis INCR took {duration:.6f}s. New Seq: {res}")
+        logging.debug(f"[Storage] Memory INCR took {duration:.6f}s. New Seq: {res}")
         return res
 
+    async def get_current_sequence(self) -> int:
+        """Gets the current sequence counter for this session from memory.
+
+        Returns:
+            int: The current sequence number.
+        """
+        start_time = time.perf_counter()
+        async with _get_cache_lock():
+            current = _SEQ_BY_SESSION.get(self.session_id, 0)
+        duration = time.perf_counter() - start_time
+        logging.debug(f"[Storage] Memory GET took {duration:.6f}s. Current Seq: {current}")
+        return current
+
     async def save_partial(self, text: str, seq: int):
-        """Saves the partial draft to Redis.
+        """Saves the partial draft to in-memory cache.
 
         Key: asr:sess:{id}:current
         TTL: 300 seconds
@@ -90,26 +131,26 @@ class StorageManager:
             seq (int): The current sequence number.
         """
         start_time = time.perf_counter()
-        key = f"asr:sess:{self.session_id}:current"
-        mapping = {
-            "content": text,
-            "seq": seq,
-            "ts": datetime.now(timezone.utc).isoformat()
-        }
-        async with redis_client.pipeline(transaction=True) as pipe:
-            pipe.hset(key, mapping=mapping)
-            pipe.expire(key, 300)
-            await pipe.execute()
+        now = time.monotonic()
+        entry = PartialEntry(
+            content=text,
+            seq=seq,
+            ts_iso=datetime.now(timezone.utc).isoformat(),
+            expires_at=now + _PARTIAL_TTL_SECONDS
+        )
+        async with _get_cache_lock():
+            _cleanup_expired_partials(now)
+            _PARTIAL_BY_SESSION[self.session_id] = entry
 
         duration = time.perf_counter() - start_time
-        logging.debug(f"[Storage] save_partial (Redis) took {duration:.6f}s")
+        logging.debug(f"[Storage] save_partial (Memory) took {duration:.6f}s")
 
     async def save_final(self, text: str):
-        """Persists the final segment to MySQL and clears the Redis draft.
+        """Persists the final segment to MySQL and clears the cached draft.
 
         1. Generates UUID.
         2. Gets next sequence number.
-        3. Schedules MySQL insertion and Redis draft deletion in a background task.
+        3. Schedules MySQL insertion and draft deletion in a background task.
 
         Args:
             text (str): The final transcription text.
@@ -150,12 +191,12 @@ class StorageManager:
                 db_duration = time.perf_counter() - start_time
                 logging.debug(f"[Storage] Background MySQL insert took {db_duration:.6f}s")
 
-                # 3b. Delete Draft from Redis
-                redis_start = time.perf_counter()
-                key = f"asr:sess:{self.session_id}:current"
-                await redis_client.delete(key)
-                redis_duration = time.perf_counter() - redis_start
-                logging.debug(f"[Storage] Background Redis DELETE took {redis_duration:.6f}s")
+                # 3b. Delete Draft from cache
+                cache_start = time.perf_counter()
+                async with _get_cache_lock():
+                    _PARTIAL_BY_SESSION.pop(self.session_id, None)
+                cache_duration = time.perf_counter() - cache_start
+                logging.debug(f"[Storage] Background cache DELETE took {cache_duration:.6f}s")
             except Exception as e:
                 logging.error(
                     f"[Storage] Background persistence failed for session {self.session_id}: {e}",

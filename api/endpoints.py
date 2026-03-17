@@ -7,7 +7,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from services.audio import AudioProcessor
 from services.storage import StorageManager
 from services.inference import ASRInferenceService
-from services.storage import redis_client
 from core.config import settings
 from core.context import session_id_ctx
 
@@ -40,9 +39,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     try:
         # Determine current sequence number to handle reconnections or continuations
-        seq_key = f"asr:sess:{session_id}:seq"
-        current_seq_raw = await redis_client.get(seq_key)
-        current_seq = int(current_seq_raw) if current_seq_raw else 0
+        current_seq = await storage.get_current_sequence()
         next_seq = current_seq + 1
 
         logging.info(f"[WebSocket] Client connected: {session_id}. Start Seq: {next_seq}")

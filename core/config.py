@@ -8,7 +8,6 @@ class Settings(BaseSettings):
     """
     PROJECT_NAME: str = "PyStreamASR"
     MYSQL_DATABASE_URL: str
-    REDIS_URL: str
     MODEL_PATH: str
     LOG_LEVEL: str = "INFO"
     LOG_DIR: str = "logs"

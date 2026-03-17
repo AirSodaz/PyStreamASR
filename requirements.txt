@@ -4,7 +4,6 @@ websockets
 sherpa-onnx
 numpy
 g711
-redis
 sqlalchemy
 aiomysql
 asyncmy
