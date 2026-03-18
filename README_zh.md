@@ -186,16 +186,18 @@ pystreamasr
 
 ### `pystreamasr` 命令说明
 
-`pystreamasr` 是在 `pyproject.toml` 中定义的控制台入口。它不会直接启动 ASR 服务，而是打开基于 Textual 的全屏终端 UI。
+`pystreamasr` 是在 `pyproject.toml` 中定义的控制台入口。它不会直接启动 ASR 服务，而是打开分层终端菜单。
 
-Textual UI 能力包括：
+菜单能力包括：
 
-- `Dashboard`：查看当前运行时、监听地址、端口、worker 数、后端状态以及 `/health` 检查结果
-- `Start` / `Stop` / `Restart`：控制已安装的后台服务
-- `Apply Host` / `Apply Port` / `Apply Workers`：直接修改 `.env` 中的 `APP_HOST`、`APP_PORT`、`APP_WORKERS`
-- `Logs` 标签页：选择日志来源、查看 tail，并可开启自动刷新
-- `Troubleshooting` 标签页：执行只读诊断，输出 pass/warn/fail 结果和修复建议
-- 快捷键：`q` 退出、`r` 刷新状态、`s` 启动、`x` 停止、`R` 重启、`Tab`/`Shift+Tab` 切换标签页
+- 主菜单仅提供导航（不直接展示详细信息）：服务操作、状态查看、配置管理、日志查看、诊断工具
+- 服务控制：`Start` / `Stop` / `Restart`
+- 运行参数更新：直接修改 `.env` 中的 `APP_HOST`、`APP_PORT`、`APP_WORKERS`
+- 状态查看子菜单：支持显式刷新
+- 日志查看子菜单：支持日志源选择和 tail 行数配置
+- 诊断子菜单：输出 pass/warn/fail 结果和修复建议
+- 每次进入子菜单或返回主菜单时会自动清屏并重绘
+- 退出规则：主菜单 `0` 退出程序；子菜单 `0` 返回主菜单
 
 具体行为取决于安装方式：
 
@@ -206,8 +208,8 @@ Textual UI 能力包括：
 
 1. 先运行 `install.ps1` 或 `install.sh`。
 2. 执行 `pystreamasr`。
-3. 在 Dashboard 中查看状态或调整 host、port、workers。
-4. 通过 Logs 和 Troubleshooting 排障，必要时重启服务使配置生效。
+3. 通过子菜单进行状态查看、参数调整和服务控制。
+4. 通过日志与诊断子菜单排障，必要时重启服务使配置生效。
 
 如果服务尚未安装，`pystreamasr` 仍可打开，但执行服务控制操作时会提示当前受管服务尚未安装。
 

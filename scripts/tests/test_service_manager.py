@@ -267,6 +267,30 @@ class ServiceManagerTests(unittest.TestCase):
         self.assertEqual(status.status, "stopped")
         self.assertFalse(status.pid_alive)
 
+    def test_windows_status_includes_autostart_flag(self) -> None:
+        """Windows status should expose scheduled-task auto-start state."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "PyStreamASR", "uvicorn")
+        self.override_method(
+            self.controller,
+            "run_command",
+            lambda args: FakeCompletedProcess(
+                stdout=json.dumps(
+                    {
+                        "Installed": True,
+                        "State": "Ready",
+                        "LastTaskResult": 0,
+                        "AutostartEnabled": True,
+                    }
+                )
+            ),
+        )
+
+        status = self.controller.get_service_status()
+
+        self.assertEqual(status.status, "stopped")
+        self.assertIsNotNone(status.active_state)
+        self.assertTrue(status.active_state.autostart_enabled)
+
     def test_linux_status_not_installed(self) -> None:
         """A missing systemd unit should report not installed."""
         controller = self.build_controller(platform_name="posix")
@@ -421,6 +445,47 @@ class ServiceManagerTests(unittest.TestCase):
         self.assertIn("Stop requested", message)
         self.assertEqual(captured_args[0][:3], ["powershell.exe", "-NoProfile", "-Command"])
         self.assertIn("Stop-ScheduledTask", captured_args[0][3])
+
+    def test_windows_enable_autostart_dispatches_to_set_scheduled_task_trigger(self) -> None:
+        """Enabling auto-start should toggle scheduled-task trigger state."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+        self.override_method(
+            self.controller,
+            "get_service_status",
+            lambda: self.make_status(
+                status="stopped",
+                backend=service_manager.WINDOWS_BACKEND,
+                service_name="CustomTask",
+                runtime="uvicorn",
+            ),
+        )
+
+        captured_args: list[list[str]] = []
+
+        def fake_run_command(args: list[str]) -> FakeCompletedProcess:
+            captured_args.append(args)
+            command = args[3]
+            if "ConvertTo-Json" in command:
+                return FakeCompletedProcess(
+                    stdout=json.dumps(
+                        {
+                            "Installed": True,
+                            "State": "Ready",
+                            "LastTaskResult": 0,
+                            "AutostartEnabled": False,
+                        }
+                    )
+                )
+            return FakeCompletedProcess(stdout="ok\n")
+
+        self.override_method(self.controller, "run_command", fake_run_command)
+
+        message = self.controller.enable_autostart()
+
+        self.assertIn("Auto-start enabled", message)
+        self.assertGreaterEqual(len(captured_args), 2)
+        self.assertIn("Set-ScheduledTask", captured_args[-1][3])
+        self.assertIn("$trigger.Enabled = $true", captured_args[-1][3])
 
     def test_linux_restart_dispatches_to_systemctl_restart(self) -> None:
         """Restart should invoke `systemctl restart` for the configured unit."""

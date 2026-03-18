@@ -1,4 +1,4 @@
-"""Terminal UI for managing the installed PyStreamASR service."""
+"""Terminal menu utilities for managing the installed PyStreamASR service."""
 
 from __future__ import annotations
 
@@ -65,6 +65,7 @@ class BackendStatus:
     manager_state: str
     detail: str
     pid: int | None = None
+    autostart_enabled: bool | None = None
 
 
 @dataclass(slots=True)
@@ -75,6 +76,7 @@ class ServiceState:
     service_name: str
     runtime: str
     manager_state: str
+    autostart_enabled: bool | None = None
     install_mode: str = "service"
     log_file: str | None = None
 
@@ -98,7 +100,7 @@ class ServiceStatus:
 
 @dataclass(slots=True)
 class LogSource:
-    """Log source that can be viewed from the TUI."""
+    """Log source that can be viewed from the terminal manager."""
 
     source_id: str
     label: str
@@ -143,6 +145,14 @@ class BaseServiceBackend:
         """Restart the service."""
         raise NotImplementedError
 
+    def set_autostart(self, enabled: bool) -> str:
+        """Enable or disable auto-start for the managed service."""
+        requested_state = "enabled" if enabled else "disabled"
+        return (
+            f"Auto-start management is unavailable for backend '{self.metadata.backend}'. "
+            f"Requested state: {requested_state}."
+        )
+
     def _command_error(self, action: str, result: subprocess.CompletedProcess[str]) -> str:
         """Normalize command failures into a single readable message."""
         output = (result.stderr or result.stdout or "").strip()
@@ -160,13 +170,17 @@ class WindowsScheduledTaskBackend(BaseServiceBackend):
         command = (
             f"$task = Get-ScheduledTask -TaskName '{safe_name}' -ErrorAction SilentlyContinue; "
             "if ($null -eq $task) { "
-            "[pscustomobject]@{ Installed = $false; State = 'NotInstalled'; LastTaskResult = 0 } "
+            "[pscustomobject]@{ Installed = $false; State = 'NotInstalled'; LastTaskResult = 0; AutostartEnabled = $null } "
             "| ConvertTo-Json -Compress; exit 0 }; "
             f"$info = Get-ScheduledTaskInfo -TaskName '{safe_name}'; "
+            "$triggers = @($task.Triggers); "
+            "$autostart = $false; "
+            "if ($triggers.Count -gt 0) { $autostart = @($triggers | Where-Object { $_.Enabled }).Count -gt 0 }; "
             "[pscustomobject]@{ "
             "Installed = $true; "
             "State = [string]$task.State; "
-            "LastTaskResult = [int]$info.LastTaskResult "
+            "LastTaskResult = [int]$info.LastTaskResult; "
+            "AutostartEnabled = [bool]$autostart "
             "} | ConvertTo-Json -Compress"
         )
 
@@ -203,12 +217,15 @@ class WindowsScheduledTaskBackend(BaseServiceBackend):
         installed = bool(payload.get("Installed"))
         raw_state = str(payload.get("State", "Unknown"))
         normalized_state = raw_state.lower()
+        autostart_raw = payload.get("AutostartEnabled")
+        autostart_enabled = autostart_raw if isinstance(autostart_raw, bool) else None
         if not installed:
             return BackendStatus(
                 installed=False,
                 active=False,
                 manager_state="not_installed",
                 detail=f"Scheduled task '{self.metadata.service_name}' is not installed.",
+                autostart_enabled=None,
             )
 
         active = normalized_state in {"running", "queued"}
@@ -222,6 +239,7 @@ class WindowsScheduledTaskBackend(BaseServiceBackend):
             active=active,
             manager_state=normalized_state,
             detail=detail,
+            autostart_enabled=autostart_enabled,
         )
 
     def start(self) -> str:
@@ -252,7 +270,29 @@ class WindowsScheduledTaskBackend(BaseServiceBackend):
         messages.append(start_message)
         return "\n".join(messages)
 
-    def _invoke(self, action: str, task_command: str) -> str:
+    def set_autostart(self, enabled: bool) -> str:
+        """Enable or disable scheduled-task triggers for auto-start behavior."""
+        status = self.get_status()
+        if not status.installed:
+            return status.detail
+
+        safe_name = self.controller.quote_powershell_literal(self.metadata.service_name)
+        enabled_literal = "$true" if enabled else "$false"
+        state_word = "enabled" if enabled else "disabled"
+        command = (
+            f"$task = Get-ScheduledTask -TaskName '{safe_name}' -ErrorAction Stop; "
+            "$triggers = @($task.Triggers); "
+            "if ($triggers.Count -eq 0) { throw 'Scheduled task has no triggers to toggle.' }; "
+            f"foreach ($trigger in $triggers) {{ $trigger.Enabled = {enabled_literal} }}; "
+            f"Set-ScheduledTask -TaskName '{safe_name}' -Trigger $triggers -ErrorAction Stop | Out-Null"
+        )
+        return self._invoke(
+            action=f"set auto-start {state_word}",
+            task_command=command,
+            success_message=f"Auto-start {state_word} for scheduled task '{self.metadata.service_name}'.",
+        )
+
+    def _invoke(self, action: str, task_command: str, success_message: str | None = None) -> str:
         """Run a task-scheduler action and return a user-facing message."""
         command = f"try {{ {task_command}; Write-Output 'ok' }} catch {{ Write-Error $_; exit 1 }}"
         try:
@@ -271,6 +311,8 @@ class WindowsScheduledTaskBackend(BaseServiceBackend):
             action.capitalize(),
             self.metadata.service_name,
         )
+        if success_message is not None:
+            return success_message
         return f"{action.capitalize()} requested for scheduled task '{self.metadata.service_name}'."
 
 
@@ -310,6 +352,8 @@ class LinuxSystemdBackend(BaseServiceBackend):
         load_state = payload.get("LoadState", "")
         active_state = payload.get("ActiveState", "")
         sub_state = payload.get("SubState", "")
+        unit_file_state = payload.get("UnitFileState", "")
+        autostart_enabled = self._parse_autostart_enabled(unit_file_state)
 
         if result.returncode != 0 and not payload:
             return BackendStatus(
@@ -328,6 +372,7 @@ class LinuxSystemdBackend(BaseServiceBackend):
                 active=False,
                 manager_state="not_installed",
                 detail=f"systemd unit '{self.metadata.service_name}' is not installed.",
+                autostart_enabled=None,
             )
 
         active = active_state in {"active", "activating", "reloading"}
@@ -342,6 +387,7 @@ class LinuxSystemdBackend(BaseServiceBackend):
             active=active,
             manager_state=active_state or "unknown",
             detail=detail,
+            autostart_enabled=autostart_enabled,
         )
 
     def start(self) -> str:
@@ -355,6 +401,39 @@ class LinuxSystemdBackend(BaseServiceBackend):
     def restart(self) -> str:
         """Restart the systemd unit."""
         return self._invoke("restart")
+
+    def set_autostart(self, enabled: bool) -> str:
+        """Enable or disable boot-time startup for the systemd unit."""
+        action = "enable" if enabled else "disable"
+        command = ["systemctl", action, self.metadata.service_name]
+        try:
+            result = self.controller.run_command(command)
+        except OSError as exc:
+            return f"Failed to {action} auto-start for systemd unit '{self.metadata.service_name}': {exc}"
+
+        if result.returncode != 0:
+            return (
+                f"Failed to {action} auto-start for systemd unit '{self.metadata.service_name}': "
+                f"{self._command_error(action, result)}"
+            )
+
+        state_word = "enabled" if enabled else "disabled"
+        self.controller.logger.info(
+            "Auto-start %s for systemd unit '%s'.",
+            state_word,
+            self.metadata.service_name,
+        )
+        return f"Auto-start {state_word} for systemd unit '{self.metadata.service_name}'."
+
+    @staticmethod
+    def _parse_autostart_enabled(unit_file_state: str) -> bool | None:
+        """Interpret systemd UnitFileState as auto-start enabled/disabled."""
+        normalized = unit_file_state.strip().lower()
+        if normalized.startswith("enabled"):
+            return True
+        if normalized.startswith("disabled"):
+            return False
+        return None
 
     def _invoke(self, action: str) -> str:
         """Run a systemd action and return a user-facing message."""
@@ -449,6 +528,7 @@ class ServiceController:
             service_name=metadata.service_name,
             runtime=metadata.runtime,
             manager_state=backend_status.manager_state,
+            autostart_enabled=backend_status.autostart_enabled,
             install_mode=metadata.install_mode,
             log_file=str(self.log_file),
         )
@@ -538,6 +618,24 @@ class ServiceController:
         self.logger.info("Restart requested.")
         return self.create_backend(self.get_install_metadata()).restart()
 
+    def set_autostart(self, enabled: bool) -> str:
+        """Enable or disable managed-service auto-start."""
+        status = self.get_service_status()
+        if status.status == "not installed":
+            self.logger.warning("Auto-start update requested but the managed service is not installed.")
+            return status.detail
+
+        self.logger.info("Auto-start update requested: %s.", "enabled" if enabled else "disabled")
+        return self.create_backend(self.get_install_metadata()).set_autostart(enabled)
+
+    def enable_autostart(self) -> str:
+        """Enable auto-start for the managed service."""
+        return self.set_autostart(True)
+
+    def disable_autostart(self) -> str:
+        """Disable auto-start for the managed service."""
+        return self.set_autostart(False)
+
     def update_host(self, raw_value: str) -> str:
         """Validate and persist a new host value."""
         normalized_host = self.validate_host(raw_value)
@@ -595,7 +693,7 @@ class ServiceController:
         return metadata
 
     def save_install_metadata(self, metadata: InstallMetadata) -> None:
-        """Persist installer metadata for later TUI sessions."""
+        """Persist installer metadata for later terminal sessions."""
         self.install_metadata_file.parent.mkdir(parents=True, exist_ok=True)
         self.install_metadata_file.write_text(
             json.dumps(asdict(metadata), indent=2) + "\n",
@@ -1311,7 +1409,7 @@ class ServiceController:
 
 
 def format_status(status: ServiceStatus) -> list[str]:
-    """Format status information for display in the TUI."""
+    """Format status information for display in the terminal manager."""
     lines = [
         f"Status: {status.status}",
         f"Configured runtime: {status.configured_runtime}",
@@ -1327,6 +1425,14 @@ def format_status(status: ServiceStatus) -> list[str]:
                 f"Service name: {status.active_state.service_name}",
                 f"Install mode: {status.active_state.install_mode}",
                 f"Manager state: {status.active_state.manager_state}",
+                "Auto start: "
+                + (
+                    "enabled"
+                    if status.active_state.autostart_enabled is True
+                    else "disabled"
+                    if status.active_state.autostart_enabled is False
+                    else "unknown"
+                ),
                 f"Runtime: {status.active_state.runtime}",
             ]
         )
@@ -1349,16 +1455,10 @@ def format_status(status: ServiceStatus) -> list[str]:
 
 def main() -> None:
     """Entrypoint for the terminal service manager."""
-    try:
-        from scripts.service_manager_tui import ServiceManagerApp
-    except ImportError as exc:
-        raise RuntimeError(
-            "Textual is required for pystreamasr TUI. Install dependencies with "
-            "'pip install -r requirements.txt'."
-        ) from exc
-
     controller = ServiceController()
-    ServiceManagerApp(controller).run()
+    from scripts.service_manager_cli import ServiceManagerCliApp
+
+    ServiceManagerCliApp(controller).run()
 
 
 if __name__ == "__main__":

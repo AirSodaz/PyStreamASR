@@ -186,16 +186,18 @@ On Linux, use `sudo pystreamasr` if service control requires elevated privileges
 
 ### What `pystreamasr` Does
 
-`pystreamasr` is the console entrypoint defined in `pyproject.toml`. It launches a full-screen Textual terminal UI instead of starting the ASR server directly.
+`pystreamasr` is the console entrypoint defined in `pyproject.toml`. It launches a layered terminal menu instead of starting the ASR server directly.
 
-The Textual UI provides:
+The menu provides:
 
-- `Dashboard`: shows configured runtime, host, port, workers, backend state, and `/health` status
-- `Start` / `Stop` / `Restart`: controls the installed background service
-- `Apply Host` / `Apply Port` / `Apply Workers`: updates `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`
-- `Logs` tab: selectable log sources with tail viewing and optional auto-refresh
-- `Troubleshooting` tab: read-only diagnostics with pass/warn/fail results and remediation hints
-- Keyboard shortcuts: `q` quit, `r` refresh status, `s` start, `x` stop, `R` restart, `Tab`/`Shift+Tab` switch tabs
+- Main-menu navigation only (no direct info rendering on the main page): service operations, status viewer, configuration manager, log viewer, and diagnostics
+- Service controls: `Start` / `Stop` / `Restart`
+- Runtime setting updates: `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`
+- Status viewer with explicit refresh option
+- Log viewer with source selection and configurable tail line count
+- Diagnostics output with pass/warn/fail summaries and remediation details
+- Screen is cleared and redrawn automatically when entering submenus and when returning to the main menu
+- Exit behavior: `0` exits from the main menu, while `0` in submenus returns to the main menu
 
 Behavior depends on how the service was installed:
 
@@ -206,8 +208,8 @@ Typical usage flow:
 
 1. Run `install.ps1` or `install.sh`.
 2. Launch `pystreamasr`.
-3. Use the Dashboard to inspect status or update host, port, and worker settings.
-4. Use the Logs and Troubleshooting tabs during incidents, then restart if configuration changes require it.
+3. Use submenu navigation for status checks, runtime setting updates, and service controls.
+4. Use the Logs and Diagnostics submenus during incidents, then restart if configuration changes require it.
 
 If the service has not been installed yet, `pystreamasr` can still open, but service actions will report that the managed service is not installed.
 
