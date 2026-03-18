@@ -4,7 +4,8 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-DEFAULT_ENV_FILE = Path(".env")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -44,7 +45,7 @@ class Settings(BaseSettings):
         return normalized_value
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(DEFAULT_ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore"

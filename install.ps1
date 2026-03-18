@@ -378,7 +378,7 @@ function Register-PyStreamASRTask {
         (ConvertTo-SingleQuotedLiteral -Value $StdoutLog), `
         (ConvertTo-SingleQuotedLiteral -Value $StderrLog)
 
-    $actionArguments = "-NoProfile -ExecutionPolicy Bypass -Command `"$launchCommand`""
+    $actionArguments = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$launchCommand`""
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArguments -WorkingDirectory $RootDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
     $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
