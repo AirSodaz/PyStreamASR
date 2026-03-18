@@ -186,13 +186,16 @@ pystreamasr
 
 ### `pystreamasr` 命令说明
 
-`pystreamasr` 是在 `pyproject.toml` 中定义的控制台入口。它不会直接启动 ASR 服务，而是打开一个交互式终端服务管理器。
+`pystreamasr` 是在 `pyproject.toml` 中定义的控制台入口。它不会直接启动 ASR 服务，而是打开基于 Textual 的全屏终端 UI。
 
-菜单能力包括：
+Textual UI 能力包括：
 
-- `View Status`：查看当前运行时、监听地址、端口、worker 数、后端类型以及 `/health` 检查结果
+- `Dashboard`：查看当前运行时、监听地址、端口、worker 数、后端状态以及 `/health` 检查结果
 - `Start` / `Stop` / `Restart`：控制已安装的后台服务
-- `Modify Host` / `Modify Port` / `Modify Workers`：直接修改 `.env` 中的 `APP_HOST`、`APP_PORT`、`APP_WORKERS`
+- `Apply Host` / `Apply Port` / `Apply Workers`：直接修改 `.env` 中的 `APP_HOST`、`APP_PORT`、`APP_WORKERS`
+- `Logs` 标签页：选择日志来源、查看 tail，并可开启自动刷新
+- `Troubleshooting` 标签页：执行只读诊断，输出 pass/warn/fail 结果和修复建议
+- 快捷键：`q` 退出、`r` 刷新状态、`s` 启动、`x` 停止、`R` 重启、`Tab`/`Shift+Tab` 切换标签页
 
 具体行为取决于安装方式：
 
@@ -203,8 +206,8 @@ pystreamasr
 
 1. 先运行 `install.ps1` 或 `install.sh`。
 2. 执行 `pystreamasr`。
-3. 在菜单中查看状态或调整 host、port、workers。
-4. 修改配置后，在同一菜单中重启服务使配置生效。
+3. 在 Dashboard 中查看状态或调整 host、port、workers。
+4. 通过 Logs 和 Troubleshooting 排障，必要时重启服务使配置生效。
 
 如果服务尚未安装，`pystreamasr` 仍可打开，但执行服务控制操作时会提示当前受管服务尚未安装。
 

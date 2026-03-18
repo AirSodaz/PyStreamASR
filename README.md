@@ -186,13 +186,16 @@ On Linux, use `sudo pystreamasr` if service control requires elevated privileges
 
 ### What `pystreamasr` Does
 
-`pystreamasr` is the console entrypoint defined in `pyproject.toml`. It launches an interactive terminal service manager instead of starting the ASR server directly.
+`pystreamasr` is the console entrypoint defined in `pyproject.toml`. It launches a full-screen Textual terminal UI instead of starting the ASR server directly.
 
-The menu provides:
+The Textual UI provides:
 
-- `View Status`: shows configured runtime, host, port, workers, backend type, and `/health` check result
+- `Dashboard`: shows configured runtime, host, port, workers, backend state, and `/health` status
 - `Start` / `Stop` / `Restart`: controls the installed background service
-- `Modify Host` / `Modify Port` / `Modify Workers`: updates `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`
+- `Apply Host` / `Apply Port` / `Apply Workers`: updates `APP_HOST`, `APP_PORT`, and `APP_WORKERS` in `.env`
+- `Logs` tab: selectable log sources with tail viewing and optional auto-refresh
+- `Troubleshooting` tab: read-only diagnostics with pass/warn/fail results and remediation hints
+- Keyboard shortcuts: `q` quit, `r` refresh status, `s` start, `x` stop, `R` restart, `Tab`/`Shift+Tab` switch tabs
 
 Behavior depends on how the service was installed:
 
@@ -203,8 +206,8 @@ Typical usage flow:
 
 1. Run `install.ps1` or `install.sh`.
 2. Launch `pystreamasr`.
-3. Use the menu to inspect status or update host, port, and worker settings.
-4. Restart the service from the same menu after changing runtime settings.
+3. Use the Dashboard to inspect status or update host, port, and worker settings.
+4. Use the Logs and Troubleshooting tabs during incidents, then restart if configuration changes require it.
 
 If the service has not been installed yet, `pystreamasr` can still open, but service actions will report that the managed service is not installed.
 

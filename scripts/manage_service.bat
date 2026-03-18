@@ -1,3 +1,3 @@
 @echo off
 call .\venv\Scripts\activate
-python scripts\service_manager.py
+python -m scripts.service_manager

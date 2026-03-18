@@ -457,6 +457,94 @@ class ServiceManagerTests(unittest.TestCase):
         self.assertIn("Restart requested", message)
         self.assertEqual(captured_args[0], ["systemctl", "restart", "pystreamasr.service"])
 
+    def test_list_log_sources_windows_includes_scheduled_task_logs(self) -> None:
+        """Windows sources should include scheduled task stdout/stderr files."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+        (self.logs_dir / "scheduled_task.stdout.log").write_text("stdout\n", encoding="utf-8")
+        (self.logs_dir / "scheduled_task.stderr.log").write_text("stderr\n", encoding="utf-8")
+        (self.logs_dir / "service_manager.log").write_text("manager\n", encoding="utf-8")
+
+        sources = self.controller.list_log_sources()
+        source_map = {source.source_id: source for source in sources}
+
+        self.assertIn("windows_stdout", source_map)
+        self.assertTrue(source_map["windows_stdout"].available)
+        self.assertIn("windows_stderr", source_map)
+        self.assertTrue(source_map["windows_stderr"].available)
+
+    def test_list_log_sources_linux_includes_journal_source(self) -> None:
+        """Linux metadata should expose a journal log source."""
+        controller = self.build_controller(platform_name="posix")
+        self.addCleanup(self.close_logger, controller.logger)
+        controller.save_install_metadata(
+            service_manager.InstallMetadata(
+                backend=service_manager.LINUX_BACKEND,
+                service_name="pystreamasr.service",
+                runtime="gunicorn",
+            )
+        )
+        self.override_method(controller, "is_journalctl_available", lambda: True)
+
+        sources = controller.list_log_sources()
+        source_map = {source.source_id: source for source in sources}
+
+        self.assertIn("linux_journal", source_map)
+        self.assertEqual(source_map["linux_journal"].kind, "journal")
+        self.assertTrue(source_map["linux_journal"].available)
+
+    def test_read_log_source_tails_file_lines(self) -> None:
+        """File-backed log reads should return only the requested tail lines."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+        self.log_file.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+        output = self.controller.read_log_source("service_manager_log", lines=2)
+
+        self.assertEqual(output, "three\nfour")
+
+    def test_run_diagnostics_reports_missing_required_env_keys(self) -> None:
+        """Diagnostics should fail required-env check when APP_* keys are missing."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+
+        class FakeBackend:
+            def get_status(self) -> service_manager.BackendStatus:
+                return service_manager.BackendStatus(
+                    installed=False,
+                    active=False,
+                    manager_state="not_installed",
+                    detail="not installed",
+                )
+
+        self.override_method(self.controller, "create_backend", lambda metadata=None: FakeBackend())
+        self.override_method(self.controller, "check_health", lambda host, port: False)
+
+        results = self.controller.run_diagnostics()
+        result_map = {item.check_name: item for item in results}
+
+        self.assertIn(".env required keys", result_map)
+        self.assertEqual(result_map[".env required keys"].status, "fail")
+
+    def test_run_diagnostics_reports_windows_log_warning_when_missing(self) -> None:
+        """Windows diagnostics should warn when scheduled-task log files are absent."""
+        self.write_metadata(service_manager.WINDOWS_BACKEND, "CustomTask", "uvicorn")
+
+        class FakeBackend:
+            def get_status(self) -> service_manager.BackendStatus:
+                return service_manager.BackendStatus(
+                    installed=True,
+                    active=False,
+                    manager_state="ready",
+                    detail="task ready",
+                )
+
+        self.override_method(self.controller, "create_backend", lambda metadata=None: FakeBackend())
+        self.override_method(self.controller, "check_health", lambda host, port: False)
+
+        results = self.controller.run_diagnostics()
+        result_map = {item.check_name: item for item in results}
+
+        self.assertIn("Backend-specific logs", result_map)
+        self.assertEqual(result_map["Backend-specific logs"].status, "warn")
+
 
 if __name__ == "__main__":
     unittest.main()

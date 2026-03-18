@@ -369,7 +369,7 @@ function Register-PyStreamASRTask {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
 
-    $launchCommand = "& { Set-Location -LiteralPath '{0}'; & '{1}' -m uvicorn 'main:app' --host '{2}' --port '{3}' --workers '{4}' 1>> '{5}' 2>> '{6}' }" -f `
+    $launchCommand = "& {{ Set-Location -LiteralPath '{0}'; `$OutputEncoding = [System.Text.UTF8Encoding]::new(`$false); [Console]::InputEncoding = [System.Text.UTF8Encoding]::new(`$false); [Console]::OutputEncoding = `$OutputEncoding; `$PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'; `$env:PYTHONUTF8 = '1'; `$env:PYTHONIOENCODING = 'utf-8'; & '{1}' -m uvicorn 'main:app' --host '{2}' --port '{3}' --workers '{4}' 1>> '{5}' 2>> '{6}' }}" -f `
         (ConvertTo-SingleQuotedLiteral -Value $RootDir), `
         (ConvertTo-SingleQuotedLiteral -Value $PythonExecutable), `
         (ConvertTo-SingleQuotedLiteral -Value $AppHost), `
@@ -381,7 +381,7 @@ function Register-PyStreamASRTask {
     $actionArguments = "-NoProfile -ExecutionPolicy Bypass -Command `"$launchCommand`""
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArguments -WorkingDirectory $RootDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
-    $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType InteractiveToken -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `

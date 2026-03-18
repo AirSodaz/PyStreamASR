@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -27,15 +29,20 @@ DEFAULT_ENV_FILE = ROOT_DIR / ".env"
 DEFAULT_STATE_FILE = ROOT_DIR / "logs" / "service_state.json"
 DEFAULT_LOG_FILE = ROOT_DIR / "logs" / "service_manager.log"
 DEFAULT_INSTALL_METADATA_FILE = ROOT_DIR / "logs" / "service_install.json"
-MENU_OPTIONS = (
-    "1. View Status",
-    "2. Start",
-    "3. Stop",
-    "4. Restart",
-    "5. Modify Host",
-    "6. Modify Port",
-    "7. Modify Workers",
-    "0. Exit",
+DATE_LOG_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\.log$")
+MAX_LOG_LINES = 5000
+DEFAULT_LOG_LINES = 200
+REQUIRED_ENV_KEYS = (
+    "MODEL_PATH",
+    "MYSQL_DATABASE_URL",
+    "APP_HOST",
+    "APP_PORT",
+    "APP_WORKERS",
+)
+MODEL_REQUIRED_FILES = (
+    "encoder.int8.onnx",
+    "decoder.int8.onnx",
+    "tokens.txt",
 )
 
 
@@ -87,6 +94,29 @@ class ServiceStatus:
     health_url: str | None
     active_state: ServiceState | None
     detail: str
+
+
+@dataclass(slots=True)
+class LogSource:
+    """Log source that can be viewed from the TUI."""
+
+    source_id: str
+    label: str
+    available: bool
+    backend: str
+    kind: str
+    descriptor: str
+
+
+@dataclass(slots=True)
+class DiagnosticResult:
+    """Troubleshooting check result."""
+
+    check_name: str
+    status: str
+    summary: str
+    detail: str
+    remediation: str
 
 
 class BaseServiceBackend:
@@ -400,6 +430,13 @@ class ServiceController:
         """Load the latest runtime settings from the environment file."""
         return get_settings(self.env_file)
 
+    def load_settings_safe(self) -> tuple[Settings | None, str | None]:
+        """Load settings and return `(settings, error)` for resilient diagnostics."""
+        try:
+            return self.load_settings(), None
+        except Exception as exc:  # pragma: no cover - defensive path
+            return None, str(exc)
+
     def get_service_status(self) -> ServiceStatus:
         """Inspect current runtime state and health information."""
         settings = self.load_settings()
@@ -522,13 +559,13 @@ class ServiceController:
         self.logger.info("Updated APP_WORKERS to %s.", normalized_workers)
         return f"Workers updated to {normalized_workers}."
 
-    def get_install_metadata(self) -> InstallMetadata:
-        """Load installer metadata, or fall back to platform defaults."""
+    def load_install_metadata(self) -> tuple[InstallMetadata, bool, str | None]:
+        """Load metadata and return `(metadata, from_file, error)`."""
         if self.install_metadata_file.exists():
             try:
                 payload = json.loads(self.install_metadata_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError):
-                payload = None
+            except (OSError, ValueError, TypeError) as exc:
+                return self.default_install_metadata(), False, str(exc)
 
             if isinstance(payload, dict):
                 backend = str(payload.get("backend", "")).strip()
@@ -536,14 +573,26 @@ class ServiceController:
                 runtime = str(payload.get("runtime", "")).strip()
                 install_mode = str(payload.get("install_mode", "service")).strip() or "service"
                 if backend and service_name and runtime:
-                    return InstallMetadata(
-                        backend=backend,
-                        service_name=service_name,
-                        runtime=runtime,
-                        install_mode=install_mode,
+                    return (
+                        InstallMetadata(
+                            backend=backend,
+                            service_name=service_name,
+                            runtime=runtime,
+                            install_mode=install_mode,
+                        ),
+                        True,
+                        None,
                     )
+                return self.default_install_metadata(), False, "Missing required metadata keys."
 
-        return self.default_install_metadata()
+            return self.default_install_metadata(), False, "Metadata payload is not a JSON object."
+
+        return self.default_install_metadata(), False, None
+
+    def get_install_metadata(self) -> InstallMetadata:
+        """Load installer metadata, or fall back to platform defaults."""
+        metadata, _, _ = self.load_install_metadata()
+        return metadata
 
     def save_install_metadata(self, metadata: InstallMetadata) -> None:
         """Persist installer metadata for later TUI sessions."""
@@ -631,6 +680,199 @@ class ServiceController:
             check=False,
         )
 
+    def read_env_values(self) -> dict[str, str]:
+        """Parse `.env` into a dictionary without validation."""
+        payload: dict[str, str] = {}
+        if not self.env_file.exists():
+            return payload
+
+        for line in self.env_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            payload[key.strip()] = value.strip()
+        return payload
+
+    def resolve_path(self, raw_path: str) -> Path:
+        """Resolve an absolute or project-relative path."""
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return self.root_dir / path
+
+    def resolve_log_dir(self, settings: Settings | None = None, env_values: dict[str, str] | None = None) -> Path:
+        """Resolve configured LOG_DIR with fallback."""
+        if settings is not None:
+            return self.resolve_path(settings.LOG_DIR)
+        values = env_values or self.read_env_values()
+        return self.resolve_path(values.get("LOG_DIR", "logs"))
+
+    def find_preferred_app_log(self, log_dir: Path) -> Path | None:
+        """Return today's date log or the latest date-stamped app log."""
+        today_name = f"{datetime.now().strftime('%Y-%m-%d')}.log"
+        today_path = log_dir / today_name
+        if today_path.exists():
+            return today_path
+
+        if not log_dir.exists():
+            return None
+
+        date_logs = sorted(
+            [path for path in log_dir.iterdir() if path.is_file() and DATE_LOG_PATTERN.match(path.name)],
+            reverse=True,
+        )
+        return date_logs[0] if date_logs else None
+
+    def is_journalctl_available(self) -> bool:
+        """Return whether `journalctl` is available."""
+        try:
+            result = self.run_command(["journalctl", "--version"])
+        except OSError:
+            return False
+        return result.returncode == 0
+
+    def tail_file_lines(self, path: Path, lines: int) -> str:
+        """Read the last `lines` lines from a UTF-8 text file."""
+        line_count = max(1, min(lines, MAX_LOG_LINES))
+        if not path.exists():
+            return f"Log file not found: {path}"
+
+        text = path.read_text(encoding="utf-8", errors="replace")
+        payload = text.splitlines()
+        if not payload:
+            return f"{path.name} is empty."
+        return "\n".join(payload[-line_count:])
+
+    def list_log_sources(self) -> list[LogSource]:
+        """List log sources for dashboard log viewing."""
+        metadata = self.get_install_metadata()
+        settings, _ = self.load_settings_safe()
+        env_values = self.read_env_values()
+        log_dir = self.resolve_log_dir(settings=settings, env_values=env_values)
+        app_log_path = self.find_preferred_app_log(log_dir)
+        sources: list[LogSource] = []
+
+        if app_log_path is None:
+            expected_today = log_dir / f"{datetime.now().strftime('%Y-%m-%d')}.log"
+            sources.append(
+                LogSource(
+                    source_id="app_log",
+                    label="Application log",
+                    available=False,
+                    backend="common",
+                    kind="file",
+                    descriptor=str(expected_today),
+                )
+            )
+        else:
+            sources.append(
+                LogSource(
+                    source_id="app_log",
+                    label="Application log",
+                    available=True,
+                    backend="common",
+                    kind="file",
+                    descriptor=str(app_log_path),
+                )
+            )
+
+        manager_log_path = log_dir / "service_manager.log"
+        sources.append(
+            LogSource(
+                source_id="service_manager_log",
+                label="Service manager log",
+                available=manager_log_path.exists(),
+                backend="common",
+                kind="file",
+                descriptor=str(manager_log_path),
+            )
+        )
+
+        if metadata.backend == WINDOWS_BACKEND:
+            stdout_path = log_dir / "scheduled_task.stdout.log"
+            stderr_path = log_dir / "scheduled_task.stderr.log"
+            sources.append(
+                LogSource(
+                    source_id="windows_stdout",
+                    label="Scheduled task stdout",
+                    available=stdout_path.exists(),
+                    backend=WINDOWS_BACKEND,
+                    kind="file",
+                    descriptor=str(stdout_path),
+                )
+            )
+            sources.append(
+                LogSource(
+                    source_id="windows_stderr",
+                    label="Scheduled task stderr",
+                    available=stderr_path.exists(),
+                    backend=WINDOWS_BACKEND,
+                    kind="file",
+                    descriptor=str(stderr_path),
+                )
+            )
+
+        if metadata.backend == LINUX_BACKEND:
+            sources.append(
+                LogSource(
+                    source_id="linux_journal",
+                    label="systemd journal",
+                    available=self.is_journalctl_available(),
+                    backend=LINUX_BACKEND,
+                    kind="journal",
+                    descriptor=f"journalctl -u {metadata.service_name} -n <lines> --no-pager",
+                )
+            )
+
+        return sources
+
+    def read_log_source(self, source_id: str, lines: int = DEFAULT_LOG_LINES) -> str:
+        """Read and return logs for a source id."""
+        if not source_id:
+            return "No log source selected."
+
+        line_count = max(1, min(lines, MAX_LOG_LINES))
+        source_map = {source.source_id: source for source in self.list_log_sources()}
+        source = source_map.get(source_id)
+        if source is None:
+            return f"Unknown log source: {source_id}"
+
+        if source.kind == "file":
+            return self.tail_file_lines(Path(source.descriptor), line_count)
+
+        if source.kind == "journal":
+            metadata = self.get_install_metadata()
+            if not self.is_journalctl_available():
+                return (
+                    "journalctl is unavailable on this system. "
+                    "Install or enable systemd-journald to view service logs."
+                )
+
+            command = [
+                "journalctl",
+                "-u",
+                metadata.service_name,
+                "-n",
+                str(line_count),
+                "--no-pager",
+                "-o",
+                "short-iso",
+            ]
+            try:
+                result = self.run_command(command)
+            except OSError as exc:
+                return f"Failed to run journalctl: {exc}"
+
+            if result.returncode != 0:
+                error_output = (result.stderr or result.stdout or "").strip()
+                return f"journalctl failed: {error_output or 'unknown error'}"
+
+            payload = result.stdout.strip()
+            return payload if payload else "No journal entries available."
+
+        return f"Unsupported log source kind: {source.kind}"
+
     @staticmethod
     def quote_powershell_literal(value: str) -> str:
         """Quote a PowerShell single-quoted literal."""
@@ -684,6 +926,355 @@ class ServiceController:
         except (urllib.error.URLError, TimeoutError, ValueError):
             return False
 
+    def run_diagnostics(self) -> list[DiagnosticResult]:
+        """Run read-only troubleshooting checks."""
+        results: list[DiagnosticResult] = []
+        settings, settings_error = self.load_settings_safe()
+        env_values = self.read_env_values()
+        metadata, metadata_from_file, metadata_error = self.load_install_metadata()
+
+        if metadata_from_file:
+            results.append(
+                DiagnosticResult(
+                    check_name="Install metadata",
+                    status="pass",
+                    summary="Install metadata is valid.",
+                    detail=f"Loaded {self.install_metadata_file}.",
+                    remediation="No action required.",
+                )
+            )
+        else:
+            status = "warn" if metadata_error is None else "fail"
+            summary = (
+                "Install metadata missing. Using platform defaults."
+                if metadata_error is None
+                else "Install metadata is invalid."
+            )
+            detail = (
+                f"{self.install_metadata_file} not found."
+                if metadata_error is None
+                else f"Could not parse {self.install_metadata_file}: {metadata_error}"
+            )
+            results.append(
+                DiagnosticResult(
+                    check_name="Install metadata",
+                    status=status,
+                    summary=summary,
+                    detail=detail,
+                    remediation=(
+                        "Re-run install.ps1/install.sh to regenerate metadata."
+                        if status == "fail"
+                        else "Run installer to persist backend metadata explicitly."
+                    ),
+                )
+            )
+
+        try:
+            backend = self.create_backend(metadata)
+            backend_status = backend.get_status()
+            if backend_status.manager_state == "error":
+                results.append(
+                    DiagnosticResult(
+                        check_name="Service manager backend",
+                        status="fail",
+                        summary="Backend query failed.",
+                        detail=backend_status.detail,
+                        remediation="Verify service manager permissions and backend tooling.",
+                    )
+                )
+            else:
+                results.append(
+                    DiagnosticResult(
+                        check_name="Service manager backend",
+                        status="pass",
+                        summary="Backend query succeeded.",
+                        detail=backend_status.detail,
+                        remediation="No action required.",
+                    )
+                )
+        except Exception as exc:
+            backend_status = None
+            results.append(
+                DiagnosticResult(
+                    check_name="Service manager backend",
+                    status="fail",
+                    summary="Backend initialization failed.",
+                    detail=str(exc),
+                    remediation="Check install metadata backend value and platform support.",
+                )
+            )
+
+        if backend_status is None:
+            results.append(
+                DiagnosticResult(
+                    check_name="Service state consistency",
+                    status="fail",
+                    summary="Service state could not be evaluated.",
+                    detail="Backend status is unavailable.",
+                    remediation="Fix backend query errors first.",
+                )
+            )
+        elif not backend_status.installed:
+            results.append(
+                DiagnosticResult(
+                    check_name="Service state consistency",
+                    status="warn",
+                    summary="Managed service is not installed.",
+                    detail=backend_status.detail,
+                    remediation="Run install.ps1/install.sh before managing service actions.",
+                )
+            )
+        elif backend_status.active:
+            if settings is None:
+                results.append(
+                    DiagnosticResult(
+                        check_name="Service state consistency",
+                        status="warn",
+                        summary="Service appears active, but settings are invalid.",
+                        detail=settings_error or "Settings load failed.",
+                        remediation="Fix .env values so health checks can run.",
+                    )
+                )
+            else:
+                health_ok = self.check_health(settings.APP_HOST, settings.APP_PORT)
+                if health_ok:
+                    results.append(
+                        DiagnosticResult(
+                            check_name="Service state consistency",
+                            status="pass",
+                            summary="Service is active and health endpoint responds.",
+                            detail=backend_status.detail,
+                            remediation="No action required.",
+                        )
+                    )
+                else:
+                    results.append(
+                        DiagnosticResult(
+                            check_name="Service state consistency",
+                            status="warn",
+                            summary="Service is active but health endpoint failed.",
+                            detail=(
+                                f"{backend_status.detail} "
+                                f"Health URL: {self.build_health_url(settings.APP_HOST, settings.APP_PORT)}"
+                            ),
+                            remediation="Inspect runtime logs and verify bind host/port settings.",
+                        )
+                    )
+        else:
+            results.append(
+                DiagnosticResult(
+                    check_name="Service state consistency",
+                    status="warn",
+                    summary="Managed service is installed but currently stopped.",
+                    detail=backend_status.detail,
+                    remediation="Start the service if runtime availability is expected.",
+                )
+            )
+
+        if settings is None:
+            results.append(
+                DiagnosticResult(
+                    check_name="Health endpoint",
+                    status="fail",
+                    summary="Health check skipped due invalid settings.",
+                    detail=settings_error or "Settings could not be loaded.",
+                    remediation="Fix required .env values and retry diagnostics.",
+                )
+            )
+        else:
+            health_ok = self.check_health(settings.APP_HOST, settings.APP_PORT)
+            health_url = self.build_health_url(settings.APP_HOST, settings.APP_PORT)
+            results.append(
+                DiagnosticResult(
+                    check_name="Health endpoint",
+                    status="pass" if health_ok else "fail",
+                    summary="Health endpoint reachable." if health_ok else "Health endpoint unreachable.",
+                    detail=health_url,
+                    remediation=(
+                        "No action required."
+                        if health_ok
+                        else "Ensure service is running and APP_HOST/APP_PORT are correct."
+                    ),
+                )
+            )
+
+        missing_keys = [key for key in REQUIRED_ENV_KEYS if not env_values.get(key)]
+        env_errors: list[str] = []
+        if not missing_keys:
+            try:
+                self.validate_host(env_values["APP_HOST"])
+            except ValueError as exc:
+                env_errors.append(str(exc))
+            try:
+                self.validate_port(env_values["APP_PORT"])
+            except ValueError as exc:
+                env_errors.append(str(exc))
+            try:
+                self.validate_workers(env_values["APP_WORKERS"])
+            except ValueError as exc:
+                env_errors.append(str(exc))
+
+        if missing_keys:
+            results.append(
+                DiagnosticResult(
+                    check_name=".env required keys",
+                    status="fail",
+                    summary="Required keys are missing in .env.",
+                    detail=", ".join(missing_keys),
+                    remediation="Add missing keys to .env and rerun diagnostics.",
+                )
+            )
+        elif env_errors:
+            results.append(
+                DiagnosticResult(
+                    check_name=".env required keys",
+                    status="fail",
+                    summary="Required keys exist but contain invalid values.",
+                    detail="; ".join(env_errors),
+                    remediation="Correct APP_HOST/APP_PORT/APP_WORKERS values in .env.",
+                )
+            )
+        else:
+            results.append(
+                DiagnosticResult(
+                    check_name=".env required keys",
+                    status="pass",
+                    summary="Required .env keys are present and valid.",
+                    detail=", ".join(REQUIRED_ENV_KEYS),
+                    remediation="No action required.",
+                )
+            )
+
+        model_path_value = ""
+        if settings is not None:
+            model_path_value = settings.MODEL_PATH
+        elif env_values.get("MODEL_PATH"):
+            model_path_value = env_values["MODEL_PATH"]
+
+        if not model_path_value:
+            results.append(
+                DiagnosticResult(
+                    check_name="Model files",
+                    status="fail",
+                    summary="MODEL_PATH is not configured.",
+                    detail="MODEL_PATH is missing from settings/.env.",
+                    remediation="Set MODEL_PATH in .env to the model directory.",
+                )
+            )
+        else:
+            model_dir = self.resolve_path(model_path_value)
+            if not model_dir.exists():
+                results.append(
+                    DiagnosticResult(
+                        check_name="Model files",
+                        status="fail",
+                        summary="Model directory does not exist.",
+                        detail=str(model_dir),
+                        remediation="Download/copy the Sherpa-onnx model to MODEL_PATH.",
+                    )
+                )
+            else:
+                missing_files = [name for name in MODEL_REQUIRED_FILES if not (model_dir / name).exists()]
+                if missing_files:
+                    results.append(
+                        DiagnosticResult(
+                            check_name="Model files",
+                            status="fail",
+                            summary="Model directory is missing required files.",
+                            detail=", ".join(missing_files),
+                            remediation="Ensure encoder.int8.onnx, decoder.int8.onnx, and tokens.txt exist.",
+                        )
+                    )
+                else:
+                    results.append(
+                        DiagnosticResult(
+                            check_name="Model files",
+                            status="pass",
+                            summary="Required model files are present.",
+                            detail=str(model_dir),
+                            remediation="No action required.",
+                        )
+                    )
+
+        log_dir = self.resolve_log_dir(settings=settings, env_values=env_values)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            probe_path = log_dir / ".write_probe.tmp"
+            probe_path.write_text("ok", encoding="utf-8")
+            probe_path.unlink(missing_ok=True)
+            results.append(
+                DiagnosticResult(
+                    check_name="Log directory",
+                    status="pass",
+                    summary="Log directory is accessible and writable.",
+                    detail=str(log_dir),
+                    remediation="No action required.",
+                )
+            )
+        except OSError as exc:
+            results.append(
+                DiagnosticResult(
+                    check_name="Log directory",
+                    status="fail",
+                    summary="Log directory is not writable.",
+                    detail=f"{log_dir}: {exc}",
+                    remediation="Fix directory permissions or update LOG_DIR.",
+                )
+            )
+
+        sources = self.list_log_sources()
+        if metadata.backend == WINDOWS_BACKEND:
+            windows_sources = {source.source_id: source for source in sources if source.backend == WINDOWS_BACKEND}
+            missing_windows = [
+                source_id
+                for source_id in ("windows_stdout", "windows_stderr")
+                if source_id not in windows_sources or not windows_sources[source_id].available
+            ]
+            if missing_windows:
+                results.append(
+                    DiagnosticResult(
+                        check_name="Backend-specific logs",
+                        status="warn",
+                        summary="Windows scheduled-task log files are partially unavailable.",
+                        detail=", ".join(missing_windows),
+                        remediation="Re-run install.ps1 or ensure scheduled task logs are created.",
+                    )
+                )
+            else:
+                results.append(
+                    DiagnosticResult(
+                        check_name="Backend-specific logs",
+                        status="pass",
+                        summary="Windows backend log files are available.",
+                        detail="scheduled_task.stdout.log and scheduled_task.stderr.log detected.",
+                        remediation="No action required.",
+                    )
+                )
+        elif metadata.backend == LINUX_BACKEND:
+            journal_source = next((source for source in sources if source.source_id == "linux_journal"), None)
+            if journal_source is None or not journal_source.available:
+                results.append(
+                    DiagnosticResult(
+                        check_name="Backend-specific logs",
+                        status="warn",
+                        summary="systemd journal logs are unavailable.",
+                        detail="journalctl was not detected or cannot be queried.",
+                        remediation="Install/enable journalctl or inspect systemd logs manually.",
+                    )
+                )
+            else:
+                results.append(
+                    DiagnosticResult(
+                        check_name="Backend-specific logs",
+                        status="pass",
+                        summary="systemd journal logs are available.",
+                        detail=journal_source.descriptor,
+                        remediation="No action required.",
+                    )
+                )
+
+        return results
+
     @staticmethod
     def validate_host(raw_value: str) -> str:
         """Validate and normalize a host string."""
@@ -719,18 +1310,8 @@ class ServiceController:
         return normalized_workers
 
 
-def clear_screen() -> None:
-    """Clear the active terminal window."""
-    os.system("cls" if os.name == "nt" else "clear")
-
-
-def prompt_for_value(prompt: str) -> str:
-    """Read a trimmed value from stdin."""
-    return input(prompt).strip()
-
-
 def format_status(status: ServiceStatus) -> list[str]:
-    """Format status information for display in the menu."""
+    """Format status information for display in the TUI."""
     lines = [
         f"Status: {status.status}",
         f"Configured runtime: {status.configured_runtime}",
@@ -766,65 +1347,18 @@ def format_status(status: ServiceStatus) -> list[str]:
     return lines
 
 
-def run_menu(controller: ServiceController) -> None:
-    """Run the interactive terminal menu."""
-    message = (
-        f"Service manager ready for {controller.get_backend_display_name()} "
-        f"({controller.get_runtime_display_name()})."
-    )
-
-    while True:
-        clear_screen()
-        print(
-            "PyStreamASR Service Manager "
-            f"({controller.get_backend_display_name()} / {controller.get_runtime_display_name()})"
-        )
-        print("=" * 28)
-        print()
-        for line in format_status(controller.get_service_status()):
-            print(line)
-        print()
-        for option in MENU_OPTIONS:
-            print(option)
-        print()
-        print(message)
-        print()
-
-        choice = prompt_for_value("Select an option: ")
-
-        if choice == "0":
-            return
-        if choice == "1":
-            message = "Status refreshed."
-        elif choice == "2":
-            message = controller.start_service()
-        elif choice == "3":
-            message = controller.stop_service()
-        elif choice == "4":
-            message = controller.restart_service()
-        elif choice == "5":
-            try:
-                message = controller.update_host(prompt_for_value("Enter new host: "))
-            except ValueError as exc:
-                message = str(exc)
-        elif choice == "6":
-            try:
-                message = controller.update_port(prompt_for_value("Enter new port: "))
-            except ValueError as exc:
-                message = str(exc)
-        elif choice == "7":
-            try:
-                message = controller.update_workers(prompt_for_value("Enter new workers: "))
-            except ValueError as exc:
-                message = str(exc)
-        else:
-            message = "Invalid selection. Choose a menu number."
-
-
 def main() -> None:
     """Entrypoint for the terminal service manager."""
+    try:
+        from scripts.service_manager_tui import ServiceManagerApp
+    except ImportError as exc:
+        raise RuntimeError(
+            "Textual is required for pystreamasr TUI. Install dependencies with "
+            "'pip install -r requirements.txt'."
+        ) from exc
+
     controller = ServiceController()
-    run_menu(controller)
+    ServiceManagerApp(controller).run()
 
 
 if __name__ == "__main__":

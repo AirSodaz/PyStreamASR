@@ -10,3 +10,4 @@ asyncmy
 pydantic-settings
 python-dotenv
 gunicorn
+textual

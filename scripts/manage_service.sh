@@ -17,4 +17,4 @@ else
   exit 1
 fi
 
-python "scripts/service_manager.py"
+python -m scripts.service_manager
