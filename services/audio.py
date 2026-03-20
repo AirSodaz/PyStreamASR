@@ -164,25 +164,37 @@ class AudioProcessor:
                 "Supported: 8000 or 16000"
             )
 
-    def _decode_g711(self, data: bytes, decoder_name: str) -> np.ndarray:
+        # Resolve decoder function once to avoid dynamic lookup in the hot loop.
+        # Default to A-law if not PCM16LE or Mu-law, matching original behavior.
+        self._decoder = None
+        self._decoder_name = ""
+        if self.input_format != "pcm16le":
+            if self.input_format == "ulaw":
+                self._decoder_name = "decode_ulaw"
+            else:
+                self._decoder_name = "decode_alaw"
+
+            self._decoder = getattr(g711, self._decoder_name, None)
+            if self._decoder is None:
+                raise RuntimeError(
+                    f"g711.{self._decoder_name} is not available. "
+                    "Please update the g711 package."
+                )
+
+    def _decode_g711(self, data: bytes) -> np.ndarray:
         """Decodes G.711 bytes to PCM (int16 or float32).
 
         Args:
             data (bytes): The input G.711 encoded audio bytes.
-            decoder_name (str): g711 decoder function name.
 
         Returns:
             np.ndarray: A numpy array of int16 PCM data or float32 data.
         """
         start_time = time.perf_counter()
 
-        decoder = getattr(g711, decoder_name, None)
-        if decoder is None:
-            raise RuntimeError(f"g711.{decoder_name} is not available. Please update the g711 package.")
-
         # g711.decode_* returns bytes representing int16 PCM (in older versions)
         # or a numpy array of float32 (in newer versions like 1.6.5)
-        decoded = decoder(data)
+        decoded = self._decoder(data)
 
         if isinstance(decoded, np.ndarray):
             result = decoded
@@ -192,7 +204,7 @@ class AudioProcessor:
 
         duration = time.perf_counter() - start_time
         logging.debug(
-            f"[Audio] decode_{decoder_name} took {duration:.6f}s. "
+            f"[Audio] {self._decoder_name} took {duration:.6f}s. "
             f"Output shape: {result.shape}, dtype: {result.dtype}"
         )
         return result
@@ -243,12 +255,9 @@ class AudioProcessor:
         if self.input_format == "pcm16le":
             # Input is raw Int16 PCM bytes
             pcm_data = np.frombuffer(chunk, dtype=np.int16)
-        elif self.input_format == "ulaw":
-            # G.711 mu-law
-            pcm_data = self._decode_g711(chunk, "decode_ulaw")
         else:
-            # Default to G.711 A-law
-            pcm_data = self._decode_g711(chunk, "decode_alaw")
+            # G.711 mu-law or A-law
+            pcm_data = self._decode_g711(chunk)
 
         # 2. Normalize to [-1, 1]
         # Whether from G.711 decode (if int16) or direct PCM16 load, we normalise here.
