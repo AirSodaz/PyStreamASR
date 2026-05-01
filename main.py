@@ -9,11 +9,14 @@ from services.inference import create_inference_executor, load_model
 from services.storage import check_database_connections, engine
 from services.schemas import Base
 from api.endpoints import router as api_router
+from core.metrics import RuntimeMetrics, empty_runtime_metrics_snapshot
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.runtime_metrics = RuntimeMetrics()
+
     # Load the model on startup
     logging.info("Loading AI Model...")
     app.state.model = load_model()
@@ -55,9 +58,16 @@ def metrics() -> dict[str, object]:
     if inference_executor is not None and hasattr(inference_executor, "snapshot"):
         inference_snapshot = inference_executor.snapshot()
 
+    runtime_metrics = getattr(app.state, "runtime_metrics", None)
+    if runtime_metrics is not None and hasattr(runtime_metrics, "snapshot"):
+        runtime_snapshot = runtime_metrics.snapshot()
+    else:
+        runtime_snapshot = empty_runtime_metrics_snapshot()
+
     return {
         "model_loaded": hasattr(app.state, "model"),
         "inference": inference_snapshot,
+        **runtime_snapshot,
     }
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import asyncio
 import contextvars
 import logging
+import time
+import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import numpy as np
@@ -22,7 +24,7 @@ from services.inference import (
     InferenceBackpressureError,
 )
 from core.config import settings
-from core.context import session_id_ctx
+from core.context import connection_id_ctx, session_id_ctx
 
 router = APIRouter()
 
@@ -86,9 +88,29 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """
     # Set correlation ID context
     token = session_id_ctx.set(session_id)
+    connection_id = uuid.uuid4().hex[:12]
+    connection_token = connection_id_ctx.set(connection_id)
+    connection_start = time.perf_counter()
+    connection_opened = False
+    connection_disconnected = False
+    connection_had_error = False
+    runtime_metrics = getattr(websocket.app.state, "runtime_metrics", None)
 
-    await websocket.accept()
-    logging.info(f"[WebSocket] Connection accepted for session: {session_id}")
+    try:
+        await websocket.accept()
+    except Exception:
+        connection_id_ctx.reset(connection_token)
+        session_id_ctx.reset(token)
+        raise
+
+    if runtime_metrics is not None:
+        runtime_metrics.record_connection_opened()
+        connection_opened = True
+
+    logging.info(
+        f"[WebSocket] Connection accepted for session: {session_id}, "
+        f"connection_id={connection_id}"
+    )
 
     # Initialize components
     processor = AudioProcessor()
@@ -122,16 +144,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             except WebSocketDisconnect:
                 raise
             except Exception as e:
+                connection_had_error = True
+                if runtime_metrics is not None:
+                    runtime_metrics.record_receive_error()
                 logging.error(f"[WebSocket] Receive error: {e}")
                 break
 
+            if runtime_metrics is not None:
+                runtime_metrics.record_websocket_chunk(len(data))
+
             # 2. Process Audio (G.711 -> PCM -> Samples)
+            audio_start = time.perf_counter()
             try:
                 ctx = contextvars.copy_context()
                 samples = await loop.run_in_executor(None, ctx.run, processor.process, data)
             except Exception as e:
+                if runtime_metrics is not None:
+                    runtime_metrics.record_audio_processing_error()
                 logging.error(f"[WebSocket] Audio processing error: {e}")
                 continue
+            else:
+                if runtime_metrics is not None:
+                    runtime_metrics.record_audio_processed(time.perf_counter() - audio_start)
 
             if debug_audio_enabled:
                 debug_audio_writer = await _append_debug_audio(
@@ -146,6 +180,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 text, is_final = await inference_service.infer(samples)
             except InferenceBackpressureError as exc:
                 skip_auto_finalize = True
+                if runtime_metrics is not None:
+                    runtime_metrics.record_overload_close()
                 logging.warning(f"[WebSocket] Inference overloaded for session {session_id}: {exc}")
                 try:
                     await _send_inference_overload_error(websocket)
@@ -161,11 +197,25 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 last_is_final = is_final
 
             if not text:
+                if runtime_metrics is not None:
+                    runtime_metrics.record_empty_result()
                 continue
 
             if is_final:
                 # 4. Save Final
-                saved_segment = await storage.save_final(text)
+                storage_start = time.perf_counter()
+                try:
+                    saved_segment = await storage.save_final(text)
+                except Exception:
+                    connection_had_error = True
+                    if runtime_metrics is not None:
+                        runtime_metrics.record_storage_error()
+                    raise
+                else:
+                    if runtime_metrics is not None:
+                        runtime_metrics.record_final_save(
+                            time.perf_counter() - storage_start
+                        )
 
                 if saved_segment:
                     next_seq = saved_segment.segment_seq + 1
@@ -173,6 +223,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 else:
                     response_seq = next_seq
                     next_seq += 1
+
+                if runtime_metrics is not None:
+                    runtime_metrics.record_final()
 
                 # 5. Feedback (Final)
                 if settings.RETURN_TRANSCRIPTION:
@@ -187,7 +240,20 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             else:
                 # 4. Save Partial
-                await storage.save_partial(text, next_seq)
+                storage_start = time.perf_counter()
+                try:
+                    await storage.save_partial(text, next_seq)
+                except Exception:
+                    if runtime_metrics is not None:
+                        runtime_metrics.record_storage_error()
+                    logging.error("[WebSocket] Failed to save partial", exc_info=True)
+                    continue
+                else:
+                    if runtime_metrics is not None:
+                        runtime_metrics.record_partial_save(
+                            time.perf_counter() - storage_start
+                        )
+                        runtime_metrics.record_partial()
 
                 # 5. Feedback (Partial)
                 if settings.RETURN_TRANSCRIPTION:
@@ -201,8 +267,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     logging.debug(f"[WebSocket] Tracking PARTIAL: {text} (Seq: {next_seq}) (Response Disabled)")
 
     except WebSocketDisconnect:
+        connection_disconnected = True
         logging.info(f"[WebSocket] Client disconnected: {session_id}")
     except Exception as e:
+        connection_had_error = True
         logging.error(f"[WebSocket] Unexpected error: {e}", exc_info=True)
     finally:
         try:
@@ -217,14 +285,32 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             )
             try:
                 # Save as final
+                storage_start = time.perf_counter()
                 saved_segment = await storage.save_final(last_text)
+                if runtime_metrics is not None:
+                    runtime_metrics.record_final_save(
+                        time.perf_counter() - storage_start
+                    )
+                    runtime_metrics.record_final()
+                    runtime_metrics.record_auto_finalized()
                 if saved_segment:
                     logging.info(f"[WebSocket] Auto-finalized segment seq: {saved_segment.segment_seq}")
             except Exception as e:
+                connection_had_error = True
+                if runtime_metrics is not None:
+                    runtime_metrics.record_storage_error()
                 logging.error(f"[WebSocket] Failed to auto-finalize pending text: {e}")
 
         if debug_audio_enabled and loop is not None:
             await _close_debug_audio_writer(loop, debug_audio_writer)
 
+        if connection_opened and runtime_metrics is not None:
+            runtime_metrics.record_connection_closed(
+                time.perf_counter() - connection_start,
+                disconnected=connection_disconnected,
+                error=connection_had_error,
+            )
+
         logging.info(f"[WebSocket] Connection closed: {session_id}")
+        connection_id_ctx.reset(connection_token)
         session_id_ctx.reset(token)

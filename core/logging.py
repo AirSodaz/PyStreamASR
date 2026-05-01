@@ -2,7 +2,7 @@ import logging
 import os
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
-from core.context import session_id_ctx
+from core.context import connection_id_ctx, session_id_ctx
 
 
 class CorrelationIdFilter(logging.Filter):
@@ -10,6 +10,7 @@ class CorrelationIdFilter(logging.Filter):
 
     def filter(self, record):
         record.session_id = session_id_ctx.get()
+        record.connection_id = connection_id_ctx.get()
         return True
 
 
@@ -33,7 +34,7 @@ def setup_logging(settings):
 
     # Define format including session_id
     formatter = logging.Formatter(
-        "%(asctime)s - [%(session_id)s] - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - [%(session_id)s/%(connection_id)s] - %(name)s - %(levelname)s - %(message)s"
     )
 
     # Filter instance

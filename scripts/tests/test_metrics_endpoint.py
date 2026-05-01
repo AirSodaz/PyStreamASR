@@ -31,6 +31,47 @@ class FakeInferenceExecutor:
         }
 
 
+class FakeRuntimeMetrics:
+    """Runtime metrics test double."""
+
+    def snapshot(self) -> dict[str, dict[str, int | float]]:
+        """Return representative runtime metrics."""
+        return {
+            "connections": {
+                "active": 1,
+                "opened": 2,
+                "closed": 1,
+                "disconnected": 1,
+                "errors": 0,
+                "duration_seconds": 3.5,
+            },
+            "websocket": {
+                "chunks_received": 4,
+                "bytes_received": 1280,
+                "receive_errors": 0,
+                "overload_closes": 1,
+            },
+            "audio": {
+                "processed_chunks": 4,
+                "processing_errors": 0,
+                "processing_seconds": 0.12,
+            },
+            "transcription": {
+                "partials": 3,
+                "finals": 1,
+                "empty_results": 2,
+                "auto_finalized": 1,
+            },
+            "storage": {
+                "partial_saves": 3,
+                "final_saves": 1,
+                "save_errors": 0,
+                "partial_seconds": 0.02,
+                "final_seconds": 0.08,
+            },
+        }
+
+
 class MetricsEndpointTests(unittest.TestCase):
     """Test simple JSON metrics response shape."""
 
@@ -47,6 +88,7 @@ class MetricsEndpointTests(unittest.TestCase):
         """Metrics endpoint should return model status and executor counters."""
         main.app.state.model = object()
         main.app.state.inference_executor = FakeInferenceExecutor()
+        main.app.state.runtime_metrics = FakeRuntimeMetrics()
 
         response = main.metrics()
 
@@ -64,8 +106,52 @@ class MetricsEndpointTests(unittest.TestCase):
                     "cpu_latency_seconds": 0.25,
                     "total_latency_seconds": 0.5,
                 },
+                "connections": {
+                    "active": 1,
+                    "opened": 2,
+                    "closed": 1,
+                    "disconnected": 1,
+                    "errors": 0,
+                    "duration_seconds": 3.5,
+                },
+                "websocket": {
+                    "chunks_received": 4,
+                    "bytes_received": 1280,
+                    "receive_errors": 0,
+                    "overload_closes": 1,
+                },
+                "audio": {
+                    "processed_chunks": 4,
+                    "processing_errors": 0,
+                    "processing_seconds": 0.12,
+                },
+                "transcription": {
+                    "partials": 3,
+                    "finals": 1,
+                    "empty_results": 2,
+                    "auto_finalized": 1,
+                },
+                "storage": {
+                    "partial_saves": 3,
+                    "final_saves": 1,
+                    "save_errors": 0,
+                    "partial_seconds": 0.02,
+                    "final_seconds": 0.08,
+                },
             },
         )
+
+    def test_metrics_endpoint_falls_back_to_empty_runtime_metrics(self) -> None:
+        """Metrics endpoint should keep the runtime shape before lifespan starts."""
+        response = main.metrics()
+
+        self.assertFalse(response["model_loaded"])
+        self.assertIsNone(response["inference"])
+        self.assertEqual(response["connections"]["active"], 0)
+        self.assertEqual(response["websocket"]["chunks_received"], 0)
+        self.assertEqual(response["audio"]["processing_errors"], 0)
+        self.assertEqual(response["transcription"]["finals"], 0)
+        self.assertEqual(response["storage"]["save_errors"], 0)
 
 
 if __name__ == "__main__":
