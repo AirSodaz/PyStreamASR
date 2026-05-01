@@ -82,6 +82,26 @@ Sent when a segment is finalized and persisted to the database.
 | `text` | string  | Finalized transcription text.                  |
 | `seq`  | integer | Segment sequence number (persisted).           |
 
+#### Error Event
+
+Sent before the server closes the connection when inference capacity is exhausted.
+
+```json
+{
+  "type": "error",
+  "code": "inference_overloaded",
+  "message": "ASR inference is overloaded; retry later.",
+  "retryable": true
+}
+```
+
+| Field       | Type    | Description                                      |
+|-------------|---------|--------------------------------------------------|
+| `type`      | string  | Always `"error"` for server-side error events.   |
+| `code`      | string  | Machine-readable error code.                     |
+| `message`   | string  | Human-readable error message.                    |
+| `retryable` | boolean | Whether the client can retry later.              |
+
 ---
 
 ### Example Request
@@ -171,6 +191,7 @@ The server closes the WebSocket gracefully when the client disconnects. No error
 |---------------------------|---------------------------------------------------------|
 | Invalid audio format      | Connection remains open; error logged server-side.      |
 | Processing error          | Skipped frame; next audio chunk processed normally.     |
+| Inference overloaded      | Sends an `error` event, then closes with code `1013`.    |
 | Database error            | Logged; partial results may still be returned.          |
 | Unexpected server error   | Connection closed; error logged with stack trace.       |
 
@@ -181,4 +202,4 @@ The server closes the WebSocket gracefully when the client disconnects. No error
 - **Audio Format:** Input must be G.711 encoded at 8kHz. The server resamples to 16kHz internally for the ASR model.
 - **Session Persistence:** Final transcriptions are stored in MySQL; partial results are cached in memory.
 - **Reconnection:** Using the same `session_id` resumes from the last sequence number.
-- **Concurrency:** Audio processing and inference run in a thread pool to avoid blocking the event loop.
+- **Concurrency:** Audio processing runs through the default executor, while ASR inference uses a bounded thread pool. When inference capacity is exhausted, clients receive `code=inference_overloaded` and the WebSocket closes with code `1013`.

@@ -32,9 +32,8 @@ except ImportError:
 try:
     import g711
 except ImportError:
-    import audioop
-    print("Warning: 'g711' library not found, using 'audioop' as fallback.")
-    g711 = None
+    print("Error: 'g711' library not found. Install it via 'pip install g711'.")
+    sys.exit(1)
 
 
 @dataclass
@@ -45,6 +44,10 @@ class StreamStats:
     messages_received: int = 0
     partials_received: int = 0
     finals_received: int = 0
+    errors_received: int = 0
+    overloads_received: int = 0
+    close_code: int | None = None
+    close_reason: str = ""
     start_time: float = 0.0
     end_time: float = 0.0
     error: Optional[str] = None
@@ -56,14 +59,13 @@ class StreamStats:
 
 def convert_to_alaw(pcm_data_int16: np.ndarray) -> bytes:
     """Convert 16-bit PCM (numpy int16 array) to G.711 A-law bytes."""
-    if g711 and hasattr(g711, "encode_alaw"):
-        try:
-            return g711.encode_alaw(pcm_data_int16.tobytes())
-        except:
-            return g711.encode_alaw(pcm_data_int16.tolist())
-    
-    import audioop
-    return audioop.lin2alaw(pcm_data_int16.tobytes(), 2)
+    if not hasattr(g711, "encode_alaw"):
+        raise RuntimeError("g711.encode_alaw is not available. Please update the g711 package.")
+
+    try:
+        return g711.encode_alaw(pcm_data_int16.tobytes())
+    except Exception:
+        return g711.encode_alaw(pcm_data_int16.tolist())
 
 
 def parse_wav_header(file_path: str) -> tuple[bool, int, int]:
@@ -162,9 +164,17 @@ async def stream_receiver(websocket, stats: StreamStats) -> None:
                 stats.partials_received += 1
             elif msg_type == "final":
                 stats.finals_received += 1
+            elif msg_type == "error":
+                stats.errors_received += 1
+                error_code = data.get("code", "unknown")
+                if error_code == "inference_overloaded":
+                    stats.overloads_received += 1
+                if not stats.error:
+                    stats.error = f"Server error: {error_code}"
                 
-    except websockets.exceptions.ConnectionClosed:
-        pass
+    except websockets.exceptions.ConnectionClosed as e:
+        stats.close_code = e.code
+        stats.close_reason = e.reason or ""
     except Exception as e:
         if not stats.error:
             stats.error = f"Receive error: {e}"
@@ -292,11 +302,25 @@ def print_summary(stats_list: list[StreamStats], total_time: float) -> None:
     print("CONCURRENT STREAMS SUMMARY")
     print(f"{'='*60}")
     
-    successful = [s for s in stats_list if s.error is None]
-    failed = [s for s in stats_list if s.error is not None]
+    overloaded = [
+        s
+        for s in stats_list
+        if s.overloads_received > 0 or s.close_code == 1013
+    ]
+    successful = [
+        s
+        for s in stats_list
+        if s.error is None and s.errors_received == 0 and s.close_code not in {1013}
+    ]
+    failed = [
+        s
+        for s in stats_list
+        if s not in successful and s not in overloaded
+    ]
     
     print(f"\nTotal Streams:    {len(stats_list)}")
     print(f"Successful:       {len(successful)}")
+    print(f"Overloaded:       {len(overloaded)}")
     print(f"Failed:           {len(failed)}")
     print(f"Total Time:       {total_time:.2f}s")
     
@@ -305,6 +329,7 @@ def print_summary(stats_list: list[StreamStats], total_time: float) -> None:
         total_messages = sum(s.messages_received for s in successful)
         total_partials = sum(s.partials_received for s in successful)
         total_finals = sum(s.finals_received for s in successful)
+        total_errors = sum(s.errors_received for s in stats_list)
         avg_duration = sum(s.duration for s in successful) / len(successful)
         
         print(f"\n--- Successful Streams ---")
@@ -312,8 +337,16 @@ def print_summary(stats_list: list[StreamStats], total_time: float) -> None:
         print(f"Total Messages Received: {total_messages}")
         print(f"  - Partials:           {total_partials}")
         print(f"  - Finals:             {total_finals}")
+        print(f"  - Errors:             {total_errors}")
         print(f"Avg Stream Duration:    {avg_duration:.2f}s")
         print(f"Throughput:             {len(successful)/total_time:.2f} streams/sec")
+
+    if overloaded:
+        print(f"\n--- Overloaded Streams ---")
+        for s in overloaded:
+            close = f" close={s.close_code}" if s.close_code is not None else ""
+            reason = f" reason={s.close_reason}" if s.close_reason else ""
+            print(f"  [{s.stream_id}] overload_events={s.overloads_received}{close}{reason}")
     
     if failed:
         print(f"\n--- Failed Streams ---")
@@ -322,11 +355,20 @@ def print_summary(stats_list: list[StreamStats], total_time: float) -> None:
     
     # Per-stream details
     print(f"\n--- Per-Stream Details ---")
-    print(f"{'Stream ID':<40} {'Chunks':>8} {'Msgs':>8} {'Duration':>10} {'Status':>10}")
-    print("-" * 80)
+    print(f"{'Stream ID':<40} {'Chunks':>8} {'Msgs':>8} {'Close':>8} {'Duration':>10} {'Status':>10}")
+    print("-" * 90)
     for s in stats_list:
-        status = "OK" if s.error is None else "FAILED"
-        print(f"{s.stream_id:<40} {s.chunks_sent:>8} {s.messages_received:>8} {s.duration:>9.2f}s {status:>10}")
+        if s in overloaded:
+            status = "OVERLOAD"
+        elif s in successful:
+            status = "OK"
+        else:
+            status = "FAILED"
+        close_code = str(s.close_code) if s.close_code is not None else "-"
+        print(
+            f"{s.stream_id:<40} {s.chunks_sent:>8} {s.messages_received:>8} "
+            f"{close_code:>8} {s.duration:>9.2f}s {status:>10}"
+        )
 
 
 async def main():

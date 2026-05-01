@@ -147,6 +147,9 @@ AUDIO_SOURCE_RATE=8000
 APP_HOST=0.0.0.0
 APP_PORT=8000
 APP_WORKERS=1
+ASR_INFERENCE_WORKERS=2
+ASR_INFERENCE_QUEUE_SIZE=8
+ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS=20.0
 ```
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -162,8 +165,13 @@ APP_WORKERS=1
 | `APP_HOST` | 否 | `0.0.0.0` | 本地启动和服务封装脚本使用的监听地址。 |
 | `APP_PORT` | 否 | `8000` | 本地启动和服务封装脚本使用的监听端口。 |
 | `APP_WORKERS` | 否 | `1` | 服务封装脚本使用的 worker 数。Windows 下配合 Uvicorn 使用，Linux/macOS 下配合 Gunicorn 使用。 |
+| `ASR_INFERENCE_WORKERS` | 否 | `max(1, cpu_count / 2)` | 单个进程内的 ASR 推理线程池大小。 |
+| `ASR_INFERENCE_QUEUE_SIZE` | 否 | `ASR_INFERENCE_WORKERS * 4` | 推理 worker 全忙时允许额外等待的调用数量。 |
+| `ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS` | 否 | `20.0` | 单次推理调用等待 worker 的最长时间；超时后连接按过载关闭。 |
 
 当 `LOG_LEVEL=DEBUG` 时，每个 WebSocket 会话都会在 `logs/debug_audio/` 下生成一个 16 kHz 单声道 WAV 文件，便于检查解码和重采样后的音频内容。
+
+ASR 推理使用专用的有界线程池。当所有推理 worker 和队列槽位都被占满时，服务会发送 `code=inference_overloaded` 的 `error` 事件，并使用 WebSocket 关闭码 `1013` 关闭连接。
 
 ## 部署方式
 

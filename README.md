@@ -147,6 +147,9 @@ AUDIO_SOURCE_RATE=8000
 APP_HOST=0.0.0.0
 APP_PORT=8000
 APP_WORKERS=1
+ASR_INFERENCE_WORKERS=2
+ASR_INFERENCE_QUEUE_SIZE=8
+ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS=20.0
 ```
 
 | Variable | Required | Default | Notes |
@@ -162,8 +165,13 @@ APP_WORKERS=1
 | `APP_HOST` | No | `0.0.0.0` | Bind host for local runs and service wrappers. |
 | `APP_PORT` | No | `8000` | Bind port for local runs and service wrappers. |
 | `APP_WORKERS` | No | `1` | Worker count used by the service wrapper. On Windows this is used with Uvicorn; on Linux/macOS it is used with Gunicorn. |
+| `ASR_INFERENCE_WORKERS` | No | `max(1, cpu_count / 2)` | Per-process ASR inference thread pool size. |
+| `ASR_INFERENCE_QUEUE_SIZE` | No | `ASR_INFERENCE_WORKERS * 4` | Additional inference calls allowed to wait before overload rejection. |
+| `ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS` | No | `20.0` | Maximum time an inference call may wait for a worker before the connection is closed as overloaded. |
 
 When `LOG_LEVEL=DEBUG`, each WebSocket session writes a 16 kHz mono WAV file under `logs/debug_audio/` so you can inspect decoded and resampled audio.
+
+ASR inference uses a dedicated bounded thread pool. If all inference workers and queue slots are busy, the server sends an `error` event with `code=inference_overloaded` and closes the WebSocket with close code `1013`.
 
 ## Deployment Options
 

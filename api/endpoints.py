@@ -13,7 +13,14 @@ from services.audio import (
     is_debug_audio_enabled,
 )
 from services.storage import StorageManager
-from services.inference import ASRInferenceService
+from services.inference import (
+    ASRInferenceService,
+    INFERENCE_OVERLOAD_CLOSE_CODE,
+    INFERENCE_OVERLOAD_CLOSE_REASON,
+    INFERENCE_OVERLOAD_ERROR_CODE,
+    INFERENCE_OVERLOAD_MESSAGE,
+    InferenceBackpressureError,
+)
 from core.config import settings
 from core.context import session_id_ctx
 
@@ -53,6 +60,20 @@ async def _close_debug_audio_writer(
         logging.error(f"[WebSocket] Failed to close debug audio writer: {exc}")
 
 
+async def _send_inference_overload_error(websocket: WebSocket) -> None:
+    """Send an inference overload event and close the WebSocket."""
+    await websocket.send_json({
+        "type": "error",
+        "code": INFERENCE_OVERLOAD_ERROR_CODE,
+        "message": INFERENCE_OVERLOAD_MESSAGE,
+        "retryable": True,
+    })
+    await websocket.close(
+        code=INFERENCE_OVERLOAD_CLOSE_CODE,
+        reason=INFERENCE_OVERLOAD_CLOSE_REASON,
+    )
+
+
 @router.websocket("/ws/transcribe/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """WebSocket endpoint for real-time speech transcription.
@@ -75,9 +96,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     # Get global model from app state
     model = websocket.app.state.model
-    inference_service = ASRInferenceService(model)
+    inference_executor = websocket.app.state.inference_executor
+    inference_service = ASRInferenceService(model, inference_executor)
     last_text: str = ""
     last_is_final: bool = True
+    skip_auto_finalize = False
     debug_audio_writer: DebugAudioWriter | None = None
     debug_audio_enabled = is_debug_audio_enabled()
 
@@ -119,7 +142,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 )
 
             # 3. Inference
-            text, is_final = await inference_service.infer(samples)
+            try:
+                text, is_final = await inference_service.infer(samples)
+            except InferenceBackpressureError as exc:
+                skip_auto_finalize = True
+                logging.warning(f"[WebSocket] Inference overloaded for session {session_id}: {exc}")
+                try:
+                    await _send_inference_overload_error(websocket)
+                except Exception as send_exc:
+                    logging.error(
+                        f"[WebSocket] Failed to send inference overload error: {send_exc}"
+                    )
+                break
 
             # Update tracking state
             if text:
@@ -177,7 +211,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             loop = None
 
         # Check if we have a pending partial result that needs to be finalized
-        if last_text and not last_is_final:
+        if last_text and not last_is_final and not skip_auto_finalize:
             logging.info(
                 f"[WebSocket] Connection closed with pending partial. Finalizing: '{last_text}'"
             )
