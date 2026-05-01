@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 import logging
 import time
 from typing import Dict
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from core.config import settings
 from services.schemas import Segment, Session
 
@@ -108,16 +108,42 @@ class StorageManager:
         return res
 
     async def get_current_sequence(self) -> int:
-        """Gets the current sequence counter for this session from memory.
+        """Gets the current sequence counter for this session.
+
+        In-memory state is used as the hot path. When the process has restarted
+        or the session is otherwise missing from memory, the counter is restored
+        from the current database maximum so partial sequence numbers continue
+        after persisted final segments.
 
         Returns:
             int: The current sequence number.
         """
         start_time = time.perf_counter()
         async with _get_cache_lock():
-            current = _SEQ_BY_SESSION.get(self.session_id, 0)
+            cached = _SEQ_BY_SESSION.get(self.session_id)
+            if cached is not None:
+                duration = time.perf_counter() - start_time
+                logging.debug(
+                    f"[Storage] Memory GET took {duration:.6f}s. Current Seq: {cached}"
+                )
+                return cached
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(func.max(Segment.segment_seq))
+                .where(Segment.session_id == self.session_id)
+            )
+            max_seq = result.scalar_one()
+
+        restored = max_seq or 0
+        async with _get_cache_lock():
+            current = max(_SEQ_BY_SESSION.get(self.session_id, 0), restored)
+            _SEQ_BY_SESSION[self.session_id] = current
+
         duration = time.perf_counter() - start_time
-        logging.debug(f"[Storage] Memory GET took {duration:.6f}s. Current Seq: {current}")
+        logging.debug(
+            f"[Storage] Sequence restore took {duration:.6f}s. Current Seq: {current}"
+        )
         return current
 
     async def save_partial(self, text: str, seq: int):
@@ -145,65 +171,62 @@ class StorageManager:
         duration = time.perf_counter() - start_time
         logging.debug(f"[Storage] save_partial (Memory) took {duration:.6f}s")
 
-    async def save_final(self, text: str):
+    async def save_final(self, text: str) -> Segment:
         """Persists the final segment to MySQL and clears the cached draft.
 
-        1. Generates UUID.
-        2. Gets next sequence number.
-        3. Schedules MySQL insertion and draft deletion in a background task.
+        The segment is inserted inside a database transaction before this
+        method returns. Sequence allocation is based on the current database
+        maximum while holding a row lock on the parent session.
 
         Args:
             text (str): The final transcription text.
 
         Returns:
-            Segment: The prepared segment object (not yet persisted).
+            Segment: The persisted segment object.
         """
-        # 1. Get Sequence (Still await this as it's fast and needed for response)
-        seq = await self.get_next_sequence()
+        await self.ensure_session_exists()
 
-        # 2. Prepare Segment
-        new_segment = Segment(
-            id=str(uuid.uuid4()),
-            session_id=self.session_id,
-            segment_seq=seq,
-            content=text,
-            created_at=datetime.now(timezone.utc)
+        start_time = time.perf_counter()
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                result = await session.execute(
+                    select(Session)
+                    .where(Session.id == self.session_id)
+                    .with_for_update()
+                )
+                existing_session = result.scalar_one_or_none()
+                if existing_session is None:
+                    raise RuntimeError(
+                        f"Session {self.session_id} could not be locked for final save"
+                    )
+
+                max_result = await session.execute(
+                    select(func.max(Segment.segment_seq))
+                    .where(Segment.session_id == self.session_id)
+                )
+                max_seq = max_result.scalar_one()
+                seq = (max_seq or 0) + 1
+
+                new_segment = Segment(
+                    id=str(uuid.uuid4()),
+                    session_id=self.session_id,
+                    segment_seq=seq,
+                    content=text,
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(new_segment)
+
+        db_duration = time.perf_counter() - start_time
+        logging.debug(
+            f"[Storage] Final MySQL insert took {db_duration:.6f}s. "
+            f"Session: {self.session_id}"
         )
 
-        # Log params at DEBUG
-        params = {
-            "id": new_segment.id,
-            "session_id": new_segment.session_id,
-            "segment_seq": new_segment.segment_seq,
-            "content": new_segment.content,
-            "created_at": str(new_segment.created_at)
-        }
-        logging.debug(f"[Storage] Scheduling background save for Segment: {params}")
-
-        # 3. Define background persistence task
-        async def _persist_segment():
-            try:
-                # 3a. Insert into MySQL
-                start_time = time.perf_counter()
-                async with AsyncSessionLocal() as session:
-                    async with session.begin():
-                        session.add(new_segment)
-                db_duration = time.perf_counter() - start_time
-                logging.debug(f"[Storage] Background MySQL insert took {db_duration:.6f}s")
-
-                # 3b. Delete Draft from cache
-                cache_start = time.perf_counter()
-                async with _get_cache_lock():
-                    _PARTIAL_BY_SESSION.pop(self.session_id, None)
-                cache_duration = time.perf_counter() - cache_start
-                logging.debug(f"[Storage] Background cache DELETE took {cache_duration:.6f}s")
-            except Exception as e:
-                logging.error(
-                    f"[Storage] Background persistence failed for session {self.session_id}: {e}",
-                    exc_info=True
-                )
-
-        # 4. Fire and forget
-        asyncio.create_task(_persist_segment())
+        cache_start = time.perf_counter()
+        async with _get_cache_lock():
+            _PARTIAL_BY_SESSION.pop(self.session_id, None)
+            _SEQ_BY_SESSION[self.session_id] = new_segment.segment_seq
+        cache_duration = time.perf_counter() - cache_start
+        logging.debug(f"[Storage] Final cache update took {cache_duration:.6f}s")
 
         return new_segment

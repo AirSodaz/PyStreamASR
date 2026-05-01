@@ -7,6 +7,7 @@ PyStreamASR is a FastAPI-based real-time ASR service for streaming speech-to-tex
 ## At a Glance
 
 - Health endpoint: `GET /health`
+- Process metrics endpoint: `GET /metrics`
 - Streaming endpoint: `WebSocket /ws/transcribe/{session_id}`
 - Input audio: `alaw`, `ulaw`, `pcm16le`
 - Internal inference audio: mono 16 kHz float32 PCM
@@ -68,7 +69,7 @@ For local development, these are the most useful `uvicorn` options:
 | --- | --- | --- |
 | `--reload` | `uvicorn main:app --reload` | Restarts the server automatically when Python source files change. Use this only in development. |
 | `--host` | `--host 0.0.0.0` | Controls the bind address. Use `127.0.0.1` for local-only access or `0.0.0.0` when other devices need to connect. |
-| `--port` | `--port 8000` | Controls which port exposes `/health` and `/ws/transcribe/{session_id}`. |
+| `--port` | `--port 8000` | Controls which port exposes `/health`, `/metrics`, and `/ws/transcribe/{session_id}`. |
 | `--workers` | `--workers 4` | Starts multiple worker processes. This is usually unnecessary during development and should not be combined with `--reload`. |
 
 Recommended development command:
@@ -100,7 +101,17 @@ Expected response shape:
 }
 ```
 
-### 2. Verify the WebSocket transcription flow
+### 2. Inspect process metrics
+
+Open:
+
+```text
+http://localhost:8000/metrics
+```
+
+The response includes current-process model status and inference executor counters such as `inflight`, `completed`, `rejected_overloaded`, and `timed_out`.
+
+### 3. Verify the WebSocket transcription flow
 
 With the virtual environment activated, run:
 

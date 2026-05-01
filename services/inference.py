@@ -4,6 +4,7 @@ import numpy as np
 import logging
 import time
 import contextvars
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Tuple, Any, TypeVar
@@ -65,6 +66,12 @@ class BoundedInferenceExecutor:
             thread_name_prefix="asr-inference",
         )
         self._closed = False
+        self._metrics_lock = threading.Lock()
+        self._completed = 0
+        self._rejected_overloaded = 0
+        self._timed_out = 0
+        self._cpu_latency_seconds = 0.0
+        self._total_latency_seconds = 0.0
 
     async def run(self, func: Callable[[], T]) -> T:
         """Run a blocking inference function with bounded queueing.
@@ -79,6 +86,7 @@ class BoundedInferenceExecutor:
             InferenceOverloadedError: If running plus queued work is at capacity.
             InferenceQueueTimeoutError: If queued work waits too long.
         """
+        total_start = time.perf_counter()
         await self._reserve_capacity()
         worker_acquired = False
         try:
@@ -89,20 +97,31 @@ class BoundedInferenceExecutor:
                 )
                 worker_acquired = True
             except asyncio.TimeoutError as exc:
+                self._record_timeout()
                 raise InferenceQueueTimeoutError(
                     "Timed out waiting for an ASR inference worker."
                 ) from exc
 
             loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(self._executor, func)
+
+            def timed_func() -> tuple[T, float]:
+                cpu_start = time.perf_counter()
+                result = func()
+                return result, time.perf_counter() - cpu_start
+
+            future = loop.run_in_executor(self._executor, timed_func)
             try:
-                return await asyncio.shield(future)
+                result, cpu_duration = await asyncio.shield(future)
             except asyncio.CancelledError:
                 try:
                     await future
                 except Exception:
                     pass
                 raise
+
+            total_duration = time.perf_counter() - total_start
+            self._record_success(cpu_duration, total_duration)
+            return result
         finally:
             if worker_acquired:
                 self._worker_slots.release()
@@ -112,8 +131,10 @@ class BoundedInferenceExecutor:
         """Reserve one running-or-queued inference slot."""
         async with self._capacity_lock:
             if self._closed:
+                self._record_overload_rejection()
                 raise InferenceOverloadedError("ASR inference executor is shut down.")
             if self._inflight >= self._capacity:
+                self._record_overload_rejection()
                 raise InferenceOverloadedError(
                     "ASR inference worker and queue capacity is exhausted."
                 )
@@ -129,6 +150,37 @@ class BoundedInferenceExecutor:
         """Stop accepting new inference work and shut down the thread pool."""
         self._closed = True
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def snapshot(self) -> dict[str, int | float]:
+        """Return a JSON-friendly read-only executor metrics snapshot."""
+        with self._metrics_lock:
+            return {
+                "max_workers": self.max_workers,
+                "queue_size": self.queue_size,
+                "inflight": self._inflight,
+                "completed": self._completed,
+                "rejected_overloaded": self._rejected_overloaded,
+                "timed_out": self._timed_out,
+                "cpu_latency_seconds": self._cpu_latency_seconds,
+                "total_latency_seconds": self._total_latency_seconds,
+            }
+
+    def _record_success(self, cpu_duration: float, total_duration: float) -> None:
+        """Record metrics for a successfully completed inference call."""
+        with self._metrics_lock:
+            self._completed += 1
+            self._cpu_latency_seconds += cpu_duration
+            self._total_latency_seconds += total_duration
+
+    def _record_overload_rejection(self) -> None:
+        """Record an inference call rejected before capacity reservation."""
+        with self._metrics_lock:
+            self._rejected_overloaded += 1
+
+    def _record_timeout(self) -> None:
+        """Record an inference call that timed out waiting for a worker."""
+        with self._metrics_lock:
+            self._timed_out += 1
 
 
 def create_inference_executor(runtime_settings: Settings = settings) -> BoundedInferenceExecutor:

@@ -1,6 +1,6 @@
 from datetime import datetime
 import uuid
-from sqlalchemy import String, Integer, Text, DateTime, Index, ForeignKey
+from sqlalchemy import String, Integer, Text, DateTime, Index, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import AsyncAttrs
 
@@ -46,4 +46,5 @@ class Segment(Base):
     # Compound index for efficient retrieval of segments by session
     __table_args__ = (
         Index("idx_session_seq", "session_id", "segment_seq"),
+        UniqueConstraint("session_id", "segment_seq", name="uq_segments_session_seq"),
     )

@@ -47,6 +47,19 @@ async def health_check():
         "model_status": "loaded" if hasattr(app.state, "model") else "not_loaded"
     }
 
+@app.get("/metrics")
+def metrics() -> dict[str, object]:
+    """Return current-process inference metrics."""
+    inference_executor = getattr(app.state, "inference_executor", None)
+    inference_snapshot = None
+    if inference_executor is not None and hasattr(inference_executor, "snapshot"):
+        inference_snapshot = inference_executor.snapshot()
+
+    return {
+        "model_loaded": hasattr(app.state, "model"),
+        "inference": inference_snapshot,
+    }
+
 if __name__ == "__main__":
     import uvicorn
 

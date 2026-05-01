@@ -142,6 +142,19 @@ def append_debug_audio_samples(
         return None
 
 
+def _as_float32_mono_contiguous(samples: np.ndarray) -> np.ndarray:
+    """Normalize audio arrays to the ASR boundary contract.
+
+    Args:
+        samples: Input audio samples.
+
+    Returns:
+        A one-dimensional C-contiguous float32 array.
+    """
+    sample_array = np.asarray(samples, dtype=np.float32).reshape(-1)
+    return np.ascontiguousarray(sample_array, dtype=np.float32)
+
+
 class AudioProcessor:
     def __init__(self):
         # Target sample rate
@@ -219,20 +232,24 @@ class AudioProcessor:
             np.ndarray: The resampled waveform as a float32 array.
         """
         start_time = time.perf_counter()
-        if self.source_rate == self.target_rate:
-            return pcm_data
+        pcm_samples = _as_float32_mono_contiguous(pcm_data)
+        if pcm_samples.size == 0:
+            return pcm_samples
 
-        duration_sec = len(pcm_data) / self.source_rate
+        if self.source_rate == self.target_rate:
+            return pcm_samples
+
+        duration_sec = len(pcm_samples) / self.source_rate
         target_len = int(duration_sec * self.target_rate)
 
         # Create time points for input and output
-        x_old = np.linspace(0, duration_sec, len(pcm_data))
+        x_old = np.linspace(0, duration_sec, len(pcm_samples))
         x_new = np.linspace(0, duration_sec, target_len)
         
         # Linear interpolation
-        resampled = np.interp(x_new, x_old, pcm_data)
+        resampled = np.interp(x_new, x_old, pcm_samples)
         
-        result = resampled.astype(np.float32)
+        result = _as_float32_mono_contiguous(resampled)
 
         duration = time.perf_counter() - start_time
         logging.debug(f"[Audio] resample took {duration:.6f}s. New shape: {result.shape}")
@@ -253,6 +270,9 @@ class AudioProcessor:
 
         # 1. Decode / Load
         if self.input_format == "pcm16le":
+            if input_len % np.dtype(np.int16).itemsize != 0:
+                raise ValueError("PCM16LE chunks must contain an even number of bytes.")
+
             # Input is raw Int16 PCM bytes
             pcm_data = np.frombuffer(chunk, dtype=np.int16)
         else:
@@ -270,4 +290,4 @@ class AudioProcessor:
         process_duration = time.perf_counter() - process_start
         logging.debug(f"[Audio] Total process took {process_duration:.6f}s")
 
-        return result
+        return _as_float32_mono_contiguous(result)

@@ -7,6 +7,7 @@ PyStreamASR 是一个面向流式语音转文本场景的 FastAPI 实时 ASR 服
 ## 核心概览
 
 - 健康检查接口：`GET /health`
+- 进程指标接口：`GET /metrics`
 - 流式转录接口：`WebSocket /ws/transcribe/{session_id}`
 - 输入音频格式：`alaw`、`ulaw`、`pcm16le`
 - 推理内部音频：单声道 16 kHz float32 PCM
@@ -68,7 +69,7 @@ PyStreamASR 是一个面向流式语音转文本场景的 FastAPI 实时 ASR 服
 | --- | --- | --- |
 | `--reload` | `uvicorn main:app --reload` | 监听 Python 源码变化并自动重启服务。仅建议在开发环境使用。 |
 | `--host` | `--host 0.0.0.0` | 控制监听地址。只本机访问时可用 `127.0.0.1`，需要让其他设备接入时用 `0.0.0.0`。 |
-| `--port` | `--port 8000` | 控制 `/health` 和 `/ws/transcribe/{session_id}` 暴露的端口。 |
+| `--port` | `--port 8000` | 控制 `/health`、`/metrics` 和 `/ws/transcribe/{session_id}` 暴露的端口。 |
 | `--workers` | `--workers 4` | 启动多个 worker 进程。开发环境通常不需要，也不应与 `--reload` 同时使用。 |
 
 推荐的开发命令：
@@ -100,7 +101,17 @@ http://localhost:8000/health
 }
 ```
 
-### 2. 验证 WebSocket 转录链路
+### 2. 查看进程指标
+
+打开：
+
+```text
+http://localhost:8000/metrics
+```
+
+返回内容包含当前进程的模型加载状态，以及 `inflight`、`completed`、`rejected_overloaded`、`timed_out` 等推理执行器计数。
+
+### 3. 验证 WebSocket 转录链路
 
 激活虚拟环境后执行：
 

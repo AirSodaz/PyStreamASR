@@ -17,10 +17,8 @@ import time
 import os
 import struct
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from dotenv import load_dotenv
-
-load_dotenv()
 
 try:
     import soundfile as sf
@@ -55,6 +53,81 @@ class StreamStats:
     @property
     def duration(self) -> float:
         return self.end_time - self.start_time if self.end_time else 0.0
+
+
+def classify_stream(stats: StreamStats) -> str:
+    """Classify one stream result for terminal and JSON summaries.
+
+    Args:
+        stats: Stream statistics collected during a load-test run.
+
+    Returns:
+        One of ``successful``, ``overloaded``, or ``failed``.
+    """
+    if stats.overloads_received > 0 or stats.close_code == 1013:
+        return "overloaded"
+    if stats.error is None and stats.errors_received == 0:
+        return "successful"
+    return "failed"
+
+
+def build_report(stats_list: list[StreamStats], total_time: float) -> dict[str, Any]:
+    """Build a JSON-friendly report for concurrent stream results.
+
+    Args:
+        stats_list: Stream statistics for every attempted stream.
+        total_time: Total wall-clock runtime in seconds.
+
+    Returns:
+        A structured dictionary suitable for ``json.dump``.
+    """
+    streams: list[dict[str, Any]] = []
+    counts = {
+        "successful": 0,
+        "overloaded": 0,
+        "failed": 0,
+    }
+
+    for stats in stats_list:
+        status = classify_stream(stats)
+        counts[status] += 1
+        streams.append(
+            {
+                "stream_id": stats.stream_id,
+                "status": status,
+                "chunks_sent": stats.chunks_sent,
+                "messages_received": stats.messages_received,
+                "partials_received": stats.partials_received,
+                "finals_received": stats.finals_received,
+                "errors_received": stats.errors_received,
+                "overloads_received": stats.overloads_received,
+                "close_code": stats.close_code,
+                "close_reason": stats.close_reason,
+                "duration_seconds": stats.duration,
+                "error": stats.error,
+            }
+        )
+
+    return {
+        "total_streams": len(stats_list),
+        "successful": counts["successful"],
+        "overloaded": counts["overloaded"],
+        "failed": counts["failed"],
+        "total_time_seconds": total_time,
+        "streams": streams,
+    }
+
+
+def write_json_report(report: dict[str, Any], output_path: str) -> None:
+    """Write a structured load-test report to disk.
+
+    Args:
+        report: JSON-friendly report data.
+        output_path: Destination JSON file path.
+    """
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+        f.write("\n")
 
 
 def convert_to_alaw(pcm_data_int16: np.ndarray) -> bytes:
@@ -241,7 +314,7 @@ async def run_concurrent_streams(
     chunk_duration: float,
     stagger_delay: float,
     verbose: bool = False
-) -> list[StreamStats]:
+) -> tuple[list[StreamStats], float]:
     """
     Runs multiple concurrent streams with optional staggered start.
     
@@ -302,21 +375,9 @@ def print_summary(stats_list: list[StreamStats], total_time: float) -> None:
     print("CONCURRENT STREAMS SUMMARY")
     print(f"{'='*60}")
     
-    overloaded = [
-        s
-        for s in stats_list
-        if s.overloads_received > 0 or s.close_code == 1013
-    ]
-    successful = [
-        s
-        for s in stats_list
-        if s.error is None and s.errors_received == 0 and s.close_code not in {1013}
-    ]
-    failed = [
-        s
-        for s in stats_list
-        if s not in successful and s not in overloaded
-    ]
+    overloaded = [s for s in stats_list if classify_stream(s) == "overloaded"]
+    successful = [s for s in stats_list if classify_stream(s) == "successful"]
+    failed = [s for s in stats_list if classify_stream(s) == "failed"]
     
     print(f"\nTotal Streams:    {len(stats_list)}")
     print(f"Successful:       {len(successful)}")
@@ -371,7 +432,9 @@ def print_summary(stats_list: list[StreamStats], total_time: float) -> None:
         )
 
 
-async def main():
+async def main() -> None:
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         description="Simulate Multiple Concurrent WebSocket Audio Streams",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -398,6 +461,7 @@ Examples:
                         help="Delay between starting each stream in seconds (default: 0, simultaneous)")
     parser.add_argument("--verbose", "-v", action="store_true", 
                         help="Print per-stream progress")
+    parser.add_argument("--json-output", help="Path to write structured JSON report")
     
     args = parser.parse_args()
     
@@ -427,6 +491,9 @@ Examples:
     
     # Print summary
     print_summary(stats_list, total_time)
+
+    if args.json_output:
+        write_json_report(build_report(stats_list, total_time), args.json_output)
 
 
 if __name__ == "__main__":

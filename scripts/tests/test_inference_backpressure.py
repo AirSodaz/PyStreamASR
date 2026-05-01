@@ -172,6 +172,52 @@ class InferenceBackpressureTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_bounded_executor_snapshot_starts_with_zero_counters(self) -> None:
+        """Executor snapshot should expose JSON-friendly initial metrics."""
+        executor = inference.BoundedInferenceExecutor(
+            max_workers=2,
+            queue_size=3,
+            queue_timeout_seconds=1.0,
+        )
+        self.addCleanup(executor.shutdown)
+
+        self.assertEqual(
+            executor.snapshot(),
+            {
+                "max_workers": 2,
+                "queue_size": 3,
+                "inflight": 0,
+                "completed": 0,
+                "rejected_overloaded": 0,
+                "timed_out": 0,
+                "cpu_latency_seconds": 0.0,
+                "total_latency_seconds": 0.0,
+            },
+        )
+
+    def test_bounded_executor_snapshot_counts_successful_completion(self) -> None:
+        """Successful runs should increment completed and latency counters."""
+        async def scenario() -> dict[str, object]:
+            executor = inference.BoundedInferenceExecutor(
+                max_workers=1,
+                queue_size=0,
+                queue_timeout_seconds=1.0,
+            )
+            try:
+                self.assertEqual(await executor.run(lambda: "ok"), "ok")
+                return executor.snapshot()
+            finally:
+                executor.shutdown()
+
+        snapshot = asyncio.run(scenario())
+
+        self.assertEqual(snapshot["completed"], 1)
+        self.assertEqual(snapshot["rejected_overloaded"], 0)
+        self.assertEqual(snapshot["timed_out"], 0)
+        self.assertEqual(snapshot["inflight"], 0)
+        self.assertGreater(snapshot["cpu_latency_seconds"], 0.0)
+        self.assertGreater(snapshot["total_latency_seconds"], 0.0)
+
     def test_bounded_executor_rejects_when_capacity_is_full(self) -> None:
         """Executor should reject immediately when running plus queued is full."""
         async def wait_for_inflight(
@@ -208,6 +254,10 @@ class InferenceBackpressureTests(unittest.TestCase):
                 with self.assertRaises(inference.InferenceOverloadedError):
                     await executor.run(lambda: "rejected")
 
+                snapshot = executor.snapshot()
+                self.assertEqual(snapshot["rejected_overloaded"], 1)
+                self.assertEqual(snapshot["completed"], 0)
+
                 release.set()
                 self.assertEqual(await first, "released")
                 self.assertEqual(await second, "queued")
@@ -239,6 +289,10 @@ class InferenceBackpressureTests(unittest.TestCase):
 
                 with self.assertRaises(inference.InferenceQueueTimeoutError):
                     await executor.run(lambda: "too-late")
+
+                snapshot = executor.snapshot()
+                self.assertEqual(snapshot["timed_out"], 1)
+                self.assertEqual(snapshot["rejected_overloaded"], 0)
 
                 release.set()
                 self.assertEqual(await first, "released")
