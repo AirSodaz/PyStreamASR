@@ -46,13 +46,13 @@ PyStreamASR is a FastAPI-based real-time ASR service for streaming speech-to-tex
    - `MYSQL_DATABASE_URL`
    - `MODEL_PATH`
 
-6. Place the Sherpa-onnx Paraformer Streaming model under:
+6. Set `MODEL_PATH` to the Sherpa-onnx Paraformer Streaming model directory. Relative paths are resolved from the project root, for example:
 
    ```text
    models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/
    ```
 
-   The current model loader expects files such as `encoder.int8.onnx`, `decoder.int8.onnx`, and `tokens.txt` in that directory.
+   The model loader reads this configured directory and expects files such as `encoder.int8.onnx`, `decoder.int8.onnx`, and `tokens.txt` inside it.
 
 7. Start the development server.
 
@@ -152,7 +152,7 @@ APP_WORKERS=1
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `MYSQL_DATABASE_URL` | Yes | None | Async SQLAlchemy DSN. Example: `mysql+aiomysql://user:password@host/dbname`. |
-| `MODEL_PATH` | Yes | None | Keep this aligned with your model directory. The current loader expects model assets under `models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/`. |
+| `MODEL_PATH` | Yes | None | Model directory used by the runtime loader. Relative paths are resolved from the project root. |
 | `PROJECT_NAME` | No | `PyStreamASR` | Used in the FastAPI app title and `/health` response. |
 | `LOG_LEVEL` | No | `INFO` | Set to `DEBUG` to capture processed audio into WAV files for troubleshooting. |
 | `LOG_DIR` | No | `logs` | Base directory for runtime logs and debug artifacts. |

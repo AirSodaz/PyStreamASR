@@ -1,35 +1,72 @@
 import asyncio
 import sherpa_onnx
-import os
 import numpy as np
 import logging
 import time
 import contextvars
+from pathlib import Path
 from typing import Tuple, Any
 
-# Define model paths relative to project root
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIR = os.path.join(PROJECT_ROOT, "models", "sherpa-onnx-streaming-paraformer-bilingual-zh-en")
+from core.config import PROJECT_ROOT, settings
 
-def load_model() -> sherpa_onnx.OnlineRecognizer:
+MODEL_REQUIRED_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt")
+
+
+def resolve_model_dir(raw_path: str | Path) -> Path:
+    """Resolve a configured model path.
+
+    Args:
+        raw_path: Absolute path or project-root-relative path from MODEL_PATH.
+
+    Returns:
+        The resolved model directory path.
+    """
+    model_dir = Path(raw_path)
+    if model_dir.is_absolute():
+        return model_dir
+
+    return PROJECT_ROOT / model_dir
+
+
+def validate_model_files(model_dir: Path) -> None:
+    """Validate that the model directory contains all required model files.
+
+    Args:
+        model_dir: Resolved model directory path.
+
+    Raises:
+        FileNotFoundError: If any required model file is missing.
+    """
+    missing_files = [name for name in MODEL_REQUIRED_FILES if not (model_dir / name).exists()]
+    if missing_files:
+        missing = ", ".join(missing_files)
+        raise FileNotFoundError(
+            f"Model directory is missing required file(s): {missing}. "
+            f"Resolved model directory: {model_dir}"
+        )
+
+
+def load_model(model_path: str | Path | None = None) -> sherpa_onnx.OnlineRecognizer:
     """Loads the Sherpa-onnx OnlineRecognizer with Paraformer model.
+
+    Args:
+        model_path: Optional model directory override. Defaults to settings.MODEL_PATH.
 
     Returns:
         sherpa_onnx.OnlineRecognizer: The loaded recognizer instance.
     """
-    logging.info(f"Loading Sherpa-onnx model from {MODEL_DIR}...")
+    model_dir = resolve_model_dir(settings.MODEL_PATH if model_path is None else model_path)
+    logging.info(f"Loading Sherpa-onnx model from {model_dir}...")
     
-    encoder = os.path.join(MODEL_DIR, "encoder.int8.onnx")
-    decoder = os.path.join(MODEL_DIR, "decoder.int8.onnx")
-    tokens = os.path.join(MODEL_DIR, "tokens.txt")
-
-    if not os.path.exists(encoder):
-        raise FileNotFoundError(f"Model file not found: {encoder}")
+    validate_model_files(model_dir)
+    encoder = model_dir / "encoder.int8.onnx"
+    decoder = model_dir / "decoder.int8.onnx"
+    tokens = model_dir / "tokens.txt"
 
     recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
-        tokens=tokens,
-        encoder=encoder,
-        decoder=decoder,
+        tokens=str(tokens),
+        encoder=str(encoder),
+        decoder=str(decoder),
         num_threads=4,
         sample_rate=16000,
         feature_dim=80,

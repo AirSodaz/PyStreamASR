@@ -46,13 +46,13 @@ PyStreamASR 是一个面向流式语音转文本场景的 FastAPI 实时 ASR 服
    - `MYSQL_DATABASE_URL`
    - `MODEL_PATH`
 
-6. 将 Sherpa-onnx Paraformer Streaming 模型放到：
+6. 将 `MODEL_PATH` 配置为 Sherpa-onnx Paraformer Streaming 模型目录。相对路径会按项目根目录解析，例如：
 
    ```text
    models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/
    ```
 
-   当前模型加载器会在该目录下查找 `encoder.int8.onnx`、`decoder.int8.onnx`、`tokens.txt` 等文件。
+   模型加载器会读取该配置目录，并在其中查找 `encoder.int8.onnx`、`decoder.int8.onnx`、`tokens.txt` 等文件。
 
 7. 启动开发服务器。
 
@@ -152,7 +152,7 @@ APP_WORKERS=1
 | 变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `MYSQL_DATABASE_URL` | 是 | 无 | Async SQLAlchemy DSN，例如 `mysql+aiomysql://user:password@host/dbname`。 |
-| `MODEL_PATH` | 是 | 无 | 建议与实际模型目录保持一致。当前加载器默认从 `models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/` 读取模型文件。 |
+| `MODEL_PATH` | 是 | 无 | 运行时模型加载目录。相对路径会按项目根目录解析。 |
 | `PROJECT_NAME` | 否 | `PyStreamASR` | 用于 FastAPI 应用标题和 `/health` 返回内容。 |
 | `LOG_LEVEL` | 否 | `INFO` | 设为 `DEBUG` 时，会输出用于排障的 WAV 调试音频。 |
 | `LOG_DIR` | 否 | `logs` | 运行日志和调试产物的基础目录。 |
