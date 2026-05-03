@@ -191,11 +191,42 @@ Use one of the following depending on your environment:
 | Scenario | Command | Notes |
 | --- | --- | --- |
 | Cross-platform direct run | `uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4` | Simple production-style launch. |
+| Docker Compose local stack | `docker compose up --build` | Starts PyStreamASR and MySQL together. Models and logs stay on the host. |
 | Windows background service | `powershell.exe -ExecutionPolicy Bypass -File .\install.ps1` | Registers the `PyStreamASR` scheduled task and installs the `pystreamasr` command. |
 | Linux persistent service | `sudo ./install.sh` | Installs a `pystreamasr.service` systemd unit and the `pystreamasr` command. |
 | Linux/macOS Gunicorn | `gunicorn main:app -c gunicorn.conf.py` | Gunicorn is not supported on Windows. |
 
-After either installer completes, use:
+### Docker Compose Local Stack
+
+The Compose stack is an optional local deployment path. It starts one PyStreamASR container and one MySQL 8.4 container, stores MySQL data in the `mysql-data` Docker volume, mounts `./models` into the app container as read-only, and writes runtime logs to `./logs`.
+
+If the Sherpa-onnx model is not already present under `models/sherpa-onnx-streaming-paraformer-bilingual-zh-en/`, download it through the helper container:
+
+```bash
+docker compose run --rm model-downloader
+```
+
+Start the full local stack:
+
+```bash
+docker compose up --build
+```
+
+Verify the app from the host:
+
+```text
+http://localhost:8000/health
+```
+
+Stop and remove the containers when finished:
+
+```bash
+docker compose down
+```
+
+The existing `.env` file remains for non-container local runs. The Compose app container receives its runtime environment from `docker-compose.yml` and does not require local secrets from `.env`. MySQL is internal to the Compose network by default; inspect it with `docker compose exec mysql mysql -upystreamasr -ppystreamasr pystreamasr` if needed.
+
+After the Windows or Linux installer completes, use:
 
 ```bash
 pystreamasr
@@ -244,6 +275,8 @@ PyStreamASR/
 ├── models/            # Sherpa-onnx model assets
 ├── scripts/           # Stream simulators, installers, and service manager
 ├── services/          # Audio, inference, storage, and database schema logic
+├── Dockerfile         # Container image for the ASR app
+├── docker-compose.yml # Local app + MySQL Compose stack
 ├── main.py            # FastAPI app entrypoint and lifespan setup
 ├── install.ps1        # Windows installer / scheduled-task setup
 ├── install.sh         # Linux installer / systemd setup
