@@ -109,7 +109,7 @@ http://localhost:8000/health
 http://localhost:8000/metrics
 ```
 
-返回内容包含当前进程的模型加载状态，以及 `inflight`、`completed`、`rejected_overloaded`、`timed_out` 等推理执行器计数。
+返回内容包含当前进程的模型加载状态，`inflight`、`completed`、`rejected_overloaded`、`timed_out` 等推理执行器计数，以及 `connections`、`websocket`、`audio`、`transcription`、`storage` 等运行时聚合指标。这些运行时指标只表示当前进程，不暴露单个会话或单条连接的明细。
 
 ### 3. 验证 WebSocket 转录链路
 
@@ -179,6 +179,8 @@ ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS=20.0
 | `ASR_INFERENCE_WORKERS` | 否 | `max(1, cpu_count / 2)` | 单个进程内的 ASR 推理线程池大小。 |
 | `ASR_INFERENCE_QUEUE_SIZE` | 否 | `ASR_INFERENCE_WORKERS * 4` | 推理 worker 全忙时允许额外等待的调用数量。 |
 | `ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS` | 否 | `20.0` | 单次推理调用等待 worker 的最长时间；超时后连接按过载关闭。 |
+
+运行日志会同时包含 `session_id` 和每次连接独有的 `connection_id`，因此同一个会话发生重连时，也能沿着单条连接追踪音频处理、推理和存储链路。
 
 当 `LOG_LEVEL=DEBUG` 时，每个 WebSocket 会话都会在 `logs/debug_audio/` 下生成一个 16 kHz 单声道 WAV 文件，便于检查解码和重采样后的音频内容。
 

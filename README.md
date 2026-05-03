@@ -109,7 +109,7 @@ Open:
 http://localhost:8000/metrics
 ```
 
-The response includes current-process model status and inference executor counters such as `inflight`, `completed`, `rejected_overloaded`, and `timed_out`.
+The response includes current-process model status, inference executor counters such as `inflight`, `completed`, `rejected_overloaded`, and `timed_out`, plus runtime groups for `connections`, `websocket`, `audio`, `transcription`, and `storage`. These runtime metrics are process-local aggregates and do not expose per-session or per-connection data.
 
 ### 3. Verify the WebSocket transcription flow
 
@@ -179,6 +179,8 @@ ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS=20.0
 | `ASR_INFERENCE_WORKERS` | No | `max(1, cpu_count / 2)` | Per-process ASR inference thread pool size. |
 | `ASR_INFERENCE_QUEUE_SIZE` | No | `ASR_INFERENCE_WORKERS * 4` | Additional inference calls allowed to wait before overload rejection. |
 | `ASR_INFERENCE_QUEUE_TIMEOUT_SECONDS` | No | `20.0` | Maximum time an inference call may wait for a worker before the connection is closed as overloaded. |
+
+Runtime logs include both the `session_id` and a per-connection `connection_id`, so reconnects for the same session can be distinguished while following one connection through audio processing, inference, and storage.
 
 When `LOG_LEVEL=DEBUG`, each WebSocket session writes a 16 kHz mono WAV file under `logs/debug_audio/` so you can inspect decoded and resampled audio.
 
